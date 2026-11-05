@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdir, writeFile, readFile, rename, rm } from "node:fs/promises";
+import { readFile, rm, mkdtemp } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -40,14 +40,51 @@ describe("defaultConfigTemplate", () => {
   });
 });
 
+// ─── keepOnline (hub mode) ──────────────────────────────────────────────────
+
+describe("keepOnline", () => {
+  it("is part of the default config template", async () => {
+    const { defaultConfigTemplate } = await import("../config.js");
+    const parsed = JSON.parse(defaultConfigTemplate());
+    expect(parsed).toHaveProperty("keepOnline");
+    expect(parsed.keepOnline).toBe(true);
+  });
+
+  it("is optional on the Config type", async () => {
+    const { saveConfig, loadConfig } = await import("../config.js");
+
+    const origToken = process.env.DISCORD_TOKEN;
+    delete process.env.DISCORD_TOKEN;
+
+    // This test uses a temporary config file — it never touches the user's
+    // real config (which holds the bot token).
+    const tempDir = await mkdtemp(join(tmpdir(), "pi-discord-remote-keeponline-"));
+    const tempFile = join(tempDir, "config.json");
+
+    try {
+      await saveConfig({ token: "t", guildId: "g" }, tempFile);
+      const withoutFlag = await loadConfig(tempFile);
+      expect(withoutFlag?.keepOnline).toBeUndefined();
+
+      await saveConfig({ token: "t", guildId: "g", keepOnline: false }, tempFile);
+      const withFlag = await loadConfig(tempFile);
+      expect(withFlag?.keepOnline).toBe(false);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+      if (origToken !== undefined) process.env.DISCORD_TOKEN = origToken;
+    }
+  });
+});
+
 // ─── saveConfig / loadConfig ──────────────────────────────────────────────────
 
 describe("saveConfig + loadConfig", () => {
   let tempDir: string;
+  let tempFile: string;
 
   beforeEach(async () => {
-    tempDir = join(tmpdir(), `pi-discord-remote-test-${Date.now()}`);
-    await mkdir(tempDir, { recursive: true });
+    tempDir = await mkdtemp(join(tmpdir(), "pi-discord-remote-test-"));
+    tempFile = join(tempDir, "config.json");
   });
 
   afterEach(async () => {
@@ -55,7 +92,7 @@ describe("saveConfig + loadConfig", () => {
   });
 
   it("saveConfig writes valid JSON", async () => {
-    const { saveConfig, CONFIG_FILE } = await import("../config.js");
+    const { saveConfig } = await import("../config.js");
 
     const cfg = {
       token: "test-token-123",
@@ -66,9 +103,9 @@ describe("saveConfig + loadConfig", () => {
       toolResponses: true,
     };
 
-    await saveConfig(cfg);
+    await saveConfig(cfg, tempFile);
 
-    const raw = await readFile(CONFIG_FILE, "utf-8");
+    const raw = await readFile(tempFile, "utf-8");
     const parsed = JSON.parse(raw);
     expect(parsed.token).toBe("test-token-123");
     expect(parsed.guildId).toBe("guild-456");
@@ -76,40 +113,28 @@ describe("saveConfig + loadConfig", () => {
     expect(parsed.allowedUserIds).toEqual(["user1", "user2"]);
     expect(parsed.reactions).toBe(false);
     expect(parsed.toolResponses).toBe(true);
-
-    // Clean up
-    await rm(CONFIG_FILE, { force: true }).catch(() => {});
   });
 
   it("loadConfig returns null when no config file and no env vars", async () => {
-    const { loadConfig, CONFIG_FILE } = await import("../config.js");
+    const { loadConfig } = await import("../config.js");
 
     const origToken = process.env.DISCORD_TOKEN;
     const origGuild = process.env.DISCORD_GUILD_ID;
     delete process.env.DISCORD_TOKEN;
     delete process.env.DISCORD_GUILD_ID;
 
-    // Backup existing config if present
-    let backup: string | null = null;
     try {
-      await rename(CONFIG_FILE, CONFIG_FILE + ".bak-test");
-      backup = CONFIG_FILE + ".bak-test";
-    } catch {
-      // didn't exist
-    }
-
-    try {
-      const result = await loadConfig();
+      // The file does not exist — the user's real config is never touched.
+      const result = await loadConfig(tempFile);
       expect(result).toBeNull();
     } finally {
-      if (backup) await rename(backup, CONFIG_FILE).catch(() => {});
       if (origToken !== undefined) process.env.DISCORD_TOKEN = origToken;
       if (origGuild !== undefined) process.env.DISCORD_GUILD_ID = origGuild;
     }
   });
 
   it("loadConfig falls back to env vars when no file exists", async () => {
-    const { loadConfig, CONFIG_FILE } = await import("../config.js");
+    const { loadConfig } = await import("../config.js");
 
     const origToken = process.env.DISCORD_TOKEN;
     const origGuild = process.env.DISCORD_GUILD_ID;
@@ -119,17 +144,8 @@ describe("saveConfig + loadConfig", () => {
     process.env.DISCORD_GUILD_ID = "env-guild";
     process.env.DISCORD_CATEGORY_ID = "env-category";
 
-    // Backup existing config if present
-    let backup: string | null = null;
     try {
-      await rename(CONFIG_FILE, CONFIG_FILE + ".bak-test2");
-      backup = CONFIG_FILE + ".bak-test2";
-    } catch {
-      // didn't exist
-    }
-
-    try {
-      const result = await loadConfig();
+      const result = await loadConfig(tempFile);
       expect(result).not.toBeNull();
       expect(result!.token).toBe("env-token");
       expect(result!.guildId).toBe("env-guild");
@@ -137,7 +153,6 @@ describe("saveConfig + loadConfig", () => {
       expect(result!.reactions).toBe(true);
       expect(result!.toolResponses).toBe(false);
     } finally {
-      if (backup) await rename(backup, CONFIG_FILE).catch(() => {});
       if (origToken !== undefined) process.env.DISCORD_TOKEN = origToken;
       else delete process.env.DISCORD_TOKEN;
       if (origGuild !== undefined) process.env.DISCORD_GUILD_ID = origGuild;
@@ -148,23 +163,24 @@ describe("saveConfig + loadConfig", () => {
   });
 
   it("DISCORD_TOKEN env var overrides file token", async () => {
-    const { loadConfig, saveConfig, CONFIG_FILE } = await import("../config.js");
+    const { loadConfig, saveConfig } = await import("../config.js");
 
     const origToken = process.env.DISCORD_TOKEN;
     process.env.DISCORD_TOKEN = "override-token";
 
     try {
-      await saveConfig({
-        token: "file-token",
-        guildId: "some-guild",
-      });
+      await saveConfig(
+        {
+          token: "file-token",
+          guildId: "some-guild",
+        },
+        tempFile,
+      );
 
-      const result = await loadConfig();
+      const result = await loadConfig(tempFile);
       expect(result).not.toBeNull();
       expect(result!.token).toBe("override-token");
       expect(result!.guildId).toBe("some-guild");
-
-      await rm(CONFIG_FILE, { force: true }).catch(() => {});
     } finally {
       if (origToken !== undefined) process.env.DISCORD_TOKEN = origToken;
       else delete process.env.DISCORD_TOKEN;
@@ -172,29 +188,30 @@ describe("saveConfig + loadConfig", () => {
   });
 
   it("loadConfig reads a previously saved config", async () => {
-    const { loadConfig, saveConfig, CONFIG_FILE } = await import("../config.js");
+    const { loadConfig, saveConfig } = await import("../config.js");
 
     const origToken = process.env.DISCORD_TOKEN;
     delete process.env.DISCORD_TOKEN;
 
     try {
-      await saveConfig({
-        token: "round-trip-token",
-        guildId: "round-trip-guild",
-        allowedUserIds: ["a", "b"],
-        reactions: false,
-        toolResponses: true,
-      });
+      await saveConfig(
+        {
+          token: "round-trip-token",
+          guildId: "round-trip-guild",
+          allowedUserIds: ["a", "b"],
+          reactions: false,
+          toolResponses: true,
+        },
+        tempFile,
+      );
 
-      const result = await loadConfig();
+      const result = await loadConfig(tempFile);
       expect(result).not.toBeNull();
       expect(result!.token).toBe("round-trip-token");
       expect(result!.guildId).toBe("round-trip-guild");
       expect(result!.allowedUserIds).toEqual(["a", "b"]);
       expect(result!.reactions).toBe(false);
       expect(result!.toolResponses).toBe(true);
-
-      await rm(CONFIG_FILE, { force: true }).catch(() => {});
     } finally {
       if (origToken !== undefined) process.env.DISCORD_TOKEN = origToken;
     }

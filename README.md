@@ -21,16 +21,53 @@ pi install npm:pi-discord-remote
    - Send Messages
    - Add Reactions
    - **Manage Channels** ← required for auto-create/delete
+4. Invite the bot with the **`applications.commands`** scope as well — the `/pi-status`
+   slash command only appears when the bot was invited with that scope. Re-invite it once
+   with this URL (`<APP_ID>` is the **Application ID** from the Developer Portal, not the bot
+   user id):
+
+   ```
+   https://discord.com/oauth2/authorize?client_id=<APP_ID>&scope=bot%20applications.commands&permissions=274145945856
+   ```
+
+   The command is registered in the guild the bot was invited to — it does not appear in other
+   servers.
 
 ## Usage
 
 ```
 /pi-discord-remote setup        — configure token, server ID, optional category
 /pi-discord-remote start        — create channel + connect
-/pi-discord-remote stop         — delete channel + disconnect
+/pi-discord-remote stop         — end the session (channel deleted), bot stays online
+/pi-discord-remote disconnect   — end the session and log out completely
 /pi-discord-remote status       — show connection state
 /pi-discord-remote open-config  — edit config JSON in Pi's editor
 ```
+
+### `/pi-status` (Discord slash command)
+
+A read-only status snapshot of the running Pi session, posted **ephemerally** — only the
+person who ran the command sees the reply. It shows what the session is doing right now
+(idle / working / waiting for your answer / error / no session), the active model and thinking
+level, the project directory with its git branch and dirty-file count, context-window usage,
+the session identity and the Discord connection health.
+
+Type `/pi-status` in the guild (any channel) — the bot answers with an embed. It never
+injects anything into the Pi session and never prints the bot token, the system prompt or
+file contents. A failed or aborted turn is reported as a generic label (`aborted`,
+`turn failed`) — the provider's raw error text stays in the local log.
+
+### Hub mode (bot online without a session)
+
+`/pi-discord-remote stop` ends the *session* but keeps the Discord connection alive, so
+`/pi-status` can still answer with **“no session connected”** (and the reconnect logic keeps
+working). In hub mode the extension ignores every channel message — there is no session
+channel, so nothing is injected into Pi.
+
+- `/pi-discord-remote disconnect` — log out completely (destroys the Discord client).
+- `/pi-discord-remote start` while in hub mode — reconnects and creates a fresh session channel.
+- `keepOnline: false` in `config.json` — restores the old behaviour where `stop` also
+  disconnects.
 
 ### Setup prompts
 
@@ -64,6 +101,7 @@ For CI or headless setups, you can skip `setup` entirely and set these env vars:
 | `allowedUserIds` | string[] | `[]` | Allow-list of Discord user IDs (empty = everyone) |
 | `reactions` | boolean | `true` | React with ⏳ while processing |
 | `toolResponses` | boolean | `false` | Also post tool outputs/results alongside tool-call labels (truncated to ≤400 chars) |
+| `keepOnline` | boolean | `true` | Keep the Discord connection alive after `/pi-discord-remote stop` (hub mode, so `/pi-status` still works). `false` = old behaviour (stop also disconnects) |
 
 Edit config with `/pi-discord-remote open-config`.
 
@@ -74,7 +112,8 @@ The extension loads silently on Pi startup — no channel is created until you e
 - **`/pi-discord-remote start`** — bot logs in, creates a text channel named `<project>-<mon><dd>-<HHMM>`, and starts listening there only
 - **Incoming message** — injected as a user prompt into the active Pi session; bot reacts ⏳ while Pi works, then posts the full response back
 - **Tool calls** — each tool invocation is labeled (🔧 bash, 📄 read, ✏️ edit, etc.) with a detail line; if `toolResponses` is on, results follow as ↩️/❌ code blocks
-- **`/pi-discord-remote stop`** (or Pi exit) — channel is deleted, bot disconnects
+- **`/pi-discord-remote stop`** — the session channel is deleted and the session state is cleared; the bot stays online so `/pi-status` keeps working (set `keepOnline: false` to disconnect as well)
+- **`/pi-discord-remote disconnect`** (or Pi exit) — the channel is deleted and the bot disconnects completely
 
 ### Optional image skill tool
 
@@ -94,13 +133,13 @@ The tool returns explicit send errors (for example `unknown_channel:<id>` or tim
 
 ### `ask_user_question` → Discord
 
-Pi's TUI-only `ask_user_question` dialog (from `@juicesharp/rpiv-ask-user-question`) is invisible over Discord remote. When Discord is connected, pi-discord-remote:
+Pi's TUI-only `ask_user_question` dialog (from `@juicesharp/rpiv-ask-user-question`) is invisible over Discord remote. While a Discord **session** is active, pi-discord-remote:
 
 1. **Blocks** the original `ask_user_question` via `tool_call` event interception — the TUI dialog never appears
 2. **Registers** `discord_ask_user_question` — a drop-in replacement that formats questions as Discord messages and collects answers from the channel
-3. **Hints** the LLM via `before_agent_start` to prefer `discord_ask_user_question` when Discord is connected
+3. **Hints** the LLM via `before_agent_start` to prefer `discord_ask_user_question` when a Discord session is active
 
-When Discord **is not** connected, the original `ask_user_question` (TUI dialog) works normally as a fallback. No need to uninstall `@juicesharp/rpiv-ask-user-question` — the two extensions coexist gracefully.
+When no Discord session is active (not connected, or hub mode after `/pi-discord-remote stop`), the original `ask_user_question` (TUI dialog) works normally as a fallback. No need to uninstall `@juicesharp/rpiv-ask-user-question` — the two extensions coexist gracefully.
 
 ## License
 
