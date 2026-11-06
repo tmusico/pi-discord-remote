@@ -1,14 +1,18 @@
 /**
- * Discord `/pi-status` slash command.
+ * Discord slash commands: `/pi-status`, `/pi-abort` and `/pi-model`.
  *
- * Three pieces, all free of any dependency on `extensions/index.ts`:
- *   • the command definition sent to Discord,
+ * Every piece is free of any dependency on `extensions/index.ts`:
+ *   • the command definitions sent to Discord,
  *   • an idempotent guild registration (upsert by name — never a bulk
  *     replace of the guild's whole command set),
- *   • the ephemeral interaction handler.
+ *   • the ephemeral interaction handlers.
  *
- * The live session snapshot is injected by the caller through
- * `deps.buildState`, so this module never has to reach into the extension.
+ * The live session state is injected by the caller through the `deps`
+ * objects, so this module never has to reach into the extension.
+ *
+ * Every reply is ephemeral — allowed, refused and error paths alike — and
+ * never carries the bot token, the system prompt, a raw provider error or
+ * file contents.
  *
  * discord.js v14 call convention (used below):
  *   commands.fetch({ guildId })      → guild commands
@@ -16,6 +20,16 @@
  *   commands.edit(id, body, guildId) → update one guild command
  */
 
+import {
+  buildModelListReply,
+  buildModelCatalog,
+  formatModelListText,
+  resolveModelSelection,
+  MODEL_CANDIDATE_LIMIT,
+  MODEL_DISPLAY_LIMIT,
+  type ModelCatalogEntry,
+  type ModelLike,
+} from "./model-control.js";
 import {
   buildStatusEmbed,
   buildStatusView,
@@ -40,6 +54,49 @@ export const PI_STATUS_COMMAND = {
 /** Name of the command as registered in Discord. */
 export const PI_STATUS_COMMAND_NAME = PI_STATUS_COMMAND.name;
 
+/**
+ * The `/pi-abort` command definition.
+ *
+ * Aborts the running agent *run* — the session, the channel and the bot
+ * connection stay alive.
+ */
+export const PI_ABORT_COMMAND = {
+  name: "pi-abort",
+  description: "Stop the running Pi agent turn (the session stays connected)",
+  type: 1,
+} as const;
+
+/** Name of the command as registered in Discord. */
+export const PI_ABORT_COMMAND_NAME = PI_ABORT_COMMAND.name;
+
+/**
+ * The `/pi-model` command definition.
+ *
+ * Without the `model` option the command lists the usable models; with it
+ * the command switches to the given model. `type: 3` is
+ * `ApplicationCommandOptionType.String`.
+ */
+export const PI_MODEL_COMMAND = {
+  name: "pi-model",
+  description: "Show the models this session can use, or switch to one (provider/model-id)",
+  type: 1,
+  options: [
+    {
+      name: "model",
+      description: "provider/model-id to switch to; omit to list",
+      type: 3,
+      required: false,
+      autocomplete: true,
+    },
+  ],
+} as const;
+
+/** Name of the command as registered in Discord. */
+export const PI_MODEL_COMMAND_NAME = PI_MODEL_COMMAND.name;
+
+/** Name of the `model` option of `/pi-model`. */
+export const PI_MODEL_OPTION_NAME = "model";
+
 // ─── Minimal structural Discord types ────────────────────────────────────────
 // Structural (instead of discord.js) types so the module can be unit-tested
 // with plain fake objects — and so a real `discord.js` Client satisfies them.
@@ -48,6 +105,25 @@ export const PI_STATUS_COMMAND_NAME = PI_STATUS_COMMAND.name;
 export interface PiStatusCommandEntry {
   id: string;
   name: string;
+}
+
+/** A chat-input option of a command definition. */
+export interface PiCommandOptionDefinition {
+  name: string;
+  description: string;
+  /** `3` = `ApplicationCommandOptionType.String`. */
+  type: number;
+  required?: boolean;
+  autocomplete?: boolean;
+}
+
+/** A command definition sent to Discord. */
+export interface PiCommandDefinition {
+  name: string;
+  description: string;
+  /** `1` = `ApplicationCommandType.ChatInput`. */
+  type: number;
+  options?: readonly PiCommandOptionDefinition[];
 }
 
 /** The subset of `ApplicationCommandManager` this module uses. */
@@ -90,6 +166,8 @@ export interface PiStatusEmbedPayload {
 export interface PiStatusInteraction {
   /** The invoking user. */
   user: { id: string };
+  /** The resolved options of the command (optional — absent in fakes). */
+  options?: { getString(name: string): string | null };
   /** Acknowledge the interaction (must happen within Discord's 3s window). */
   deferReply(options?: { ephemeral?: boolean }): Promise<unknown>;
   /** Edit the deferred reply. */
@@ -131,6 +209,18 @@ export interface PiStatusRegistrationResult {
 /** OAuth2 permissions bitfield used by the re-invite URL. */
 export const PI_STATUS_INVITE_PERMISSIONS = "274145945856";
 
+/**
+ * The fixed, leak-free error code of a failed command registration.
+ *
+ * The underlying Discord error may carry the bot token, the system prompt
+ * or a raw provider error — none of it ever leaves this module. The
+ * actionable hint (the re-invite URL) is reported separately.
+ */
+export const REGISTRATION_FAILED_CODE = "discord_command_registration_failed";
+
+/** The fixed, leak-free error code of a client that is not ready yet. */
+export const REGISTRATION_NOT_READY_CODE = "discord_application_not_ready";
+
 /** Base URL of the bot OAuth2 authorization endpoint. */
 export const DISCORD_OAUTH_URL = "https://discord.com/oauth2/authorize";
 
@@ -163,40 +253,40 @@ function normalizeCommand(entry: unknown): PiStatusCommandEntry | null {
   return { id: command.id, name: command.name };
 }
 
-/** Find the already-registered `/pi-status` command, if any. */
-function findExistingCommand(
+/**
+ * Index the fetched command list by name.
+ *
+ * Handles plain command objects as well as the `[key, value]` tuples a
+ * discord.js `Collection` yields when it is iterated directly.
+ */
+function indexCommandsByName(
   commands: Iterable<unknown> | null | undefined,
-): PiStatusCommandEntry | null {
-  if (!commands) return null;
+): Map<string, PiStatusCommandEntry> {
+  const index = new Map<string, PiStatusCommandEntry>();
+  if (!commands) return index;
   for (const entry of commands) {
     const command = normalizeCommand(entry);
-    if (command && command.name === PI_STATUS_COMMAND_NAME) return command;
+    if (command) index.set(command.name, command);
   }
-  return null;
+  return index;
 }
 
-/** Collect a short, loggable description of an unknown error. */
-function describeError(err: unknown): string {
-  const parts: string[] = [];
-  if (err instanceof Error) parts.push(err.message);
-  else if (typeof err === "string") parts.push(err);
-  else if (err !== undefined && err !== null) parts.push(String(err));
-
-  if (err && typeof err === "object") {
-    const e = err as { code?: unknown; status?: unknown; body?: unknown; rawError?: unknown };
-    if (e.code !== undefined) parts.push(`code=${String(e.code)}`);
-    if (e.status !== undefined) parts.push(`status=${String(e.status)}`);
-    if (typeof e.body === "string") parts.push(e.body);
-    else if (e.body && typeof e.body === "object") {
-      try {
-        parts.push(JSON.stringify(e.body));
-      } catch {
-        /* ignore unserializable bodies */
-      }
-    }
+/**
+ * Build the plain body sent to Discord for one command.
+ *
+ * `options` are only sent when the command actually has some — Discord
+ * rejects an empty option list.
+ */
+function buildCommandBody(command: PiCommandDefinition): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    name: command.name,
+    description: command.description,
+    type: command.type,
+  };
+  if (Array.isArray(command.options) && command.options.length > 0) {
+    body.options = command.options.map((option) => ({ ...option }));
   }
-  const text = parts.join(" ").trim();
-  return text.length > 0 ? text.slice(0, 400) : "unknown_error";
+  return body;
 }
 
 /**
@@ -205,20 +295,18 @@ function describeError(err: unknown): string {
  *
  * Discord answers HTTP 403 with `{"message": "Missing Access", "code": 50013}`;
  * some proxies/edge cases answer with a bare 403 without a body.
+ *
+ * The check is deliberately narrow: the error's `code`/`status` and the
+ * literal "missing access" marker of its message. The message itself is
+ * never propagated — it may contain a secret.
  */
 export function isMissingCommandScopeError(err: unknown): boolean {
-  if (err && typeof err === "object") {
-    const e = err as { code?: unknown; status?: unknown };
-    if (e.code === 50013 || e.code === "50013") return true;
-    if (e.status === 403 || e.status === "403") return true;
-  }
-  return /missing access/i.test(describeError(err));
-}
-
-/** Remove the bot token from a message before it is returned/logged. */
-function redact(text: string, token: string): string {
-  if (!token) return text;
-  return text.split(token).join("***");
+  if (!err || typeof err !== "object") return false;
+  const e = err as { code?: unknown; status?: unknown; message?: unknown };
+  if (e.code === 50013 || e.code === "50013") return true;
+  if (e.status === 403 || e.status === "403") return true;
+  if (typeof e.message === "string" && /missing access/i.test(e.message)) return true;
+  return false;
 }
 
 /**
@@ -236,49 +324,141 @@ function resolveApplicationId(client: PiStatusClient): string | null {
 }
 
 /**
- * Register (or update) `/pi-status` in a guild — idempotently.
+ * Build the actionable hint for a missing `applications.commands` scope.
  *
- * The guild's other commands are never touched: the existing `/pi-status`
- * command is edited in place, otherwise a new one is created. A bulk
- * `commands.set(...)` would delete every other command of the same bot
- * application, so it is deliberately not used.
+ * Returns `undefined` when the error is something else.
+ */
+function buildScopeHint(err: unknown, client: PiStatusClient): string | undefined {
+  if (!isMissingCommandScopeError(err)) return undefined;
+  const appId = resolveApplicationId(client);
+  const inviteUrl = buildPiStatusInviteUrl(appId ?? "<APP_ID>");
+  return appId
+    ? `The bot is missing the applications.commands scope — re-invite it: ${inviteUrl}`
+    : `The bot is missing the applications.commands scope — re-invite it with the ` +
+      `application id from the Discord Developer Portal: ${inviteUrl}`;
+}
+
+/** Per-command outcome of {@link registerPiCommands}. */
+export interface PiCommandRegistrationOutcome {
+  /** Name of the command this outcome belongs to. */
+  name: string;
+  /** Did the command end up registered? */
+  ok: boolean;
+  /** Short, leak-free error description (absent on success). */
+  error?: string;
+  /** Actionable hint (e.g. the re-invite URL when the OAuth scope is missing). */
+  hint?: string;
+}
+
+/** Result of {@link registerPiCommands}. */
+export interface PiCommandRegistrationResult {
+  /** Did every requested command end up registered? */
+  ok: boolean;
+  /** First error (absent when everything worked). */
+  error?: string;
+  /** Actionable hint (e.g. the re-invite URL when the OAuth scope is missing). */
+  hint?: string;
+  /** One outcome per requested command, in the requested order. */
+  outcomes: PiCommandRegistrationOutcome[];
+}
+
+/**
+ * Register (or update) a set of commands in a guild — idempotently.
+ *
+ * The guild's commands are fetched **once** and indexed by name; every
+ * requested command is then edited in place (when it already exists) or
+ * created. A bulk `commands.set(...)` would delete every other command of
+ * the same bot application, so it is deliberately not used — commands of
+ * other bots and commands with other names are never touched.
+ *
+ * A failure of one command does not stop the others: every command reports
+ * its own outcome.
  *
  * `token` is part of the signature for call-site symmetry with the rest of
- * the extension; the authenticated client already carries the bot
- * credentials, so the token is only used to redact it from error messages.
+ * the extension. It is never used any more: no error message, body or
+ * stack ever leaves this module, so there is nothing left to redact.
+ */
+export async function registerPiCommands(
+  client: PiStatusClient,
+  token: string,
+  guildId: string,
+  commands: readonly PiCommandDefinition[],
+): Promise<PiCommandRegistrationResult> {
+  const outcomes: PiCommandRegistrationOutcome[] = [];
+
+  try {
+    const manager = client.application?.commands;
+    if (!manager) {
+      return { ok: false, error: REGISTRATION_NOT_READY_CODE, outcomes };
+    }
+
+    // Fetch the guild's commands once — the index is reused for every
+    // requested command.
+    let existing: Map<string, PiStatusCommandEntry>;
+    try {
+      existing = indexCommandsByName(await manager.fetch({ guildId }));
+    } catch (err) {
+      return {
+        ok: false,
+        error: REGISTRATION_FAILED_CODE,
+        hint: buildScopeHint(err, client),
+        outcomes,
+      };
+    }
+
+    for (const command of Array.isArray(commands) ? commands : []) {
+      if (!command || typeof command.name !== "string" || command.name.length === 0) continue;
+      const body = buildCommandBody(command);
+      try {
+        const found = existing.get(command.name);
+        if (found) {
+          await manager.edit(found.id, body, guildId);
+        } else {
+          await manager.create(body, guildId);
+        }
+        outcomes.push({ name: command.name, ok: true });
+      } catch (err) {
+        // One broken command must not keep the others from being registered.
+        outcomes.push({
+          name: command.name,
+          ok: false,
+          error: REGISTRATION_FAILED_CODE,
+          hint: buildScopeHint(err, client),
+        });
+      }
+    }
+
+    const failed = outcomes.find((outcome) => !outcome.ok);
+    return {
+      ok: !failed,
+      error: failed?.error,
+      hint: failed?.hint,
+      outcomes,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: REGISTRATION_FAILED_CODE,
+      hint: buildScopeHint(err, client),
+      outcomes,
+    };
+  }
+}
+
+/**
+ * Register (or update) `/pi-status` in a guild — idempotently.
+ *
+ * Thin wrapper over {@link registerPiCommands}: the guild's other commands
+ * are never touched — the existing `/pi-status` command is edited in
+ * place, otherwise a new one is created.
  */
 export async function registerPiStatusCommand(
   client: PiStatusClient,
   token: string,
   guildId: string,
 ): Promise<PiStatusRegistrationResult> {
-  try {
-    const commands = client.application?.commands;
-    if (!commands) {
-      return { ok: false, error: "discord_application_not_ready" };
-    }
-
-    const existing = findExistingCommand(await commands.fetch({ guildId }));
-
-    if (existing) {
-      await commands.edit(existing.id, { ...PI_STATUS_COMMAND }, guildId);
-    } else {
-      await commands.create({ ...PI_STATUS_COMMAND }, guildId);
-    }
-    return { ok: true };
-  } catch (err) {
-    const error = redact(describeError(err), token);
-    if (isMissingCommandScopeError(err)) {
-      const appId = resolveApplicationId(client);
-      const inviteUrl = buildPiStatusInviteUrl(appId ?? "<APP_ID>");
-      const hint = appId
-        ? `The bot is missing the applications.commands scope — re-invite it: ${inviteUrl}`
-        : `The bot is missing the applications.commands scope — re-invite it with the ` +
-          `application id from the Discord Developer Portal: ${inviteUrl}`;
-      return { ok: false, error, hint };
-    }
-    return { ok: false, error };
-  }
+  const result = await registerPiCommands(client, token, guildId, [PI_STATUS_COMMAND]);
+  return { ok: result.ok, error: result.error, hint: result.hint };
 }
 
 // ─── Interaction handler ─────────────────────────────────────────────────────
@@ -335,5 +515,574 @@ export async function handlePiStatusInteraction(
       /* the deferred reply is gone — nothing else we can do */
     }
     return { ok: false, error: "status_unavailable" };
+  }
+}
+
+// ─── Shared helpers (safe rendering + leak-free logging) ────────────────────
+
+/**
+ * Short, leak-free description of an unknown error.
+ *
+ * Only a **fixed** category is kept — never the message and never
+ * `err.name`: `name` is a writable property, so a provider error could
+ * carry any text in it (the bot token, the system prompt, file contents).
+ * The built-in error classes are recognized through `instanceof` (their
+ * prototype chain cannot be forged by assigning a property), so the
+ * returned category always comes from this fixed vocabulary.
+ */
+function describeErrorSafely(err: unknown): string {
+  if (err instanceof TypeError) return "TypeError";
+  if (err instanceof RangeError) return "RangeError";
+  if (err instanceof ReferenceError) return "ReferenceError";
+  if (err instanceof SyntaxError) return "SyntaxError";
+  if (err instanceof Error) return "Error";
+  if (typeof err === "string") return "Error";
+  return "unknown_error";
+}
+
+/** Trimmed, non-empty string — or `null`. */
+function cleanText(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return null;
+  if (trimmed === "undefined" || trimmed === "NaN") return null;
+  return trimmed;
+}
+
+/**
+ * Read a string option of a chat-input interaction.
+ *
+ * `getString` throws in discord.js when the option does not exist — that
+ * must never break the reply, so the failure degrades to "no value".
+ */
+function readStringOption(interaction: PiStatusInteraction, name: string): string | null {
+  try {
+    const value = interaction.options?.getString(name);
+    return cleanText(value);
+  } catch {
+    return null;
+  }
+}
+
+/** The current model id of the session — `null` when it cannot be read. */
+function safeCurrentModelId(deps: { currentModelId?: () => string | null }): string | null {
+  try {
+    return cleanText(deps.currentModelId?.());
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The note rendered with the model list — `null` when there is none.
+ *
+ * The note is never read from the error path; it only states *where* the
+ * model list came from (e.g. "the scope API is unavailable").
+ */
+function safeScopeNote(deps: { scopeNote?: () => string | null }): string | null {
+  try {
+    return cleanText(deps.scopeNote?.());
+  } catch {
+    return null;
+  }
+}
+
+// ─── /pi-abort ───────────────────────────────────────────────────────────────
+
+/** Outcome of an abort attempt. */
+export type PiAbortOutcome = {
+  kind: "aborted" | "idle" | "no_session" | "unsupported";
+};
+
+/** Dependencies of {@link handlePiAbortInteraction}. */
+export interface PiAbortInteractionDeps {
+  /** Allow-list of Discord user ids. Empty/undefined = allow everyone. */
+  allowedUserIds?: string[];
+  /** Aborts the running turn and reports what happened. */
+  abortRun: () => PiAbortOutcome | Promise<PiAbortOutcome>;
+}
+
+/** Result of {@link handlePiAbortInteraction} — safe to log. */
+export interface PiAbortInteractionResult {
+  ok: boolean;
+  error?: string;
+}
+
+/** A run was running and has been aborted. */
+export const PI_ABORT_ABORTED = "🛑 Aborted the current run. The session is still connected.";
+
+/** Nothing was running. */
+export const PI_ABORT_IDLE = "Nothing is running — there is nothing to abort.";
+
+/** The bot is online, but no Pi session is connected. */
+export const PI_ABORT_NO_SESSION = "No Pi session is connected.";
+
+/** The session is not available (replaced / reloaded). */
+export const PI_ABORT_UNAVAILABLE = "⚠️ The session is not available right now.";
+
+/** Render the outcome of an abort attempt. */
+function renderAbortOutcome(outcome: PiAbortOutcome): string {
+  switch (outcome?.kind) {
+    case "aborted":
+      return PI_ABORT_ABORTED;
+    case "idle":
+      return PI_ABORT_IDLE;
+    case "no_session":
+      return PI_ABORT_NO_SESSION;
+    default:
+      return PI_ABORT_UNAVAILABLE;
+  }
+}
+
+/**
+ * Handle a `/pi-abort` interaction.
+ *
+ * Only the *run* is aborted — the session, the channel and the bot
+ * connection stay alive. Every path is ephemeral: refusals, success and
+ * internal errors.
+ */
+export async function handlePiAbortInteraction(
+  interaction: PiStatusInteraction,
+  deps: PiAbortInteractionDeps,
+): Promise<PiAbortInteractionResult> {
+  const allowed = deps.allowedUserIds;
+  if (Array.isArray(allowed) && allowed.length > 0 && !allowed.includes(interaction.user.id)) {
+    try {
+      await interaction.reply({ content: PI_STATUS_REFUSAL, ephemeral: true });
+    } catch (err) {
+      console.error(
+        "[pi-discord-remote] /pi-abort: refusal reply failed:",
+        describeErrorSafely(err),
+      );
+      return { ok: false, error: "refusal_failed" };
+    }
+    return { ok: false, error: "not_allowed" };
+  }
+
+  // Acknowledge first: Discord only allows 3 seconds for the first reply.
+  try {
+    await interaction.deferReply({ ephemeral: true });
+  } catch (err) {
+    console.error("[pi-discord-remote] /pi-abort: deferReply failed:", describeErrorSafely(err));
+    return { ok: false, error: "defer_failed" };
+  }
+
+  try {
+    const outcome = await deps.abortRun();
+    await interaction.editReply({ content: renderAbortOutcome(outcome) });
+    return { ok: true };  } catch (err) {
+    // The detail stays in the local log — the Discord reply must never
+    // expose a stack trace, the bot token, the system prompt or file
+    // contents.
+    console.error("[pi-discord-remote] /pi-abort: abort failed:", describeErrorSafely(err));
+    try {
+      await interaction.editReply({ content: PI_ABORT_UNAVAILABLE });
+    } catch {
+      /* the deferred reply is gone — nothing else we can do */
+    }
+    return { ok: false, error: "abort_failed" };
+  }
+}
+
+// ─── /pi-model ───────────────────────────────────────────────────────────────
+
+/** Outcome of a model switch. */
+export type PiModelSwitchOutcome =
+  | { kind: "switched"; model: ModelLike; thinkingLevel?: string | null }
+  | { kind: "unknown"; query: string; suggestions: ModelCatalogEntry[] }
+  | { kind: "ambiguous"; query: string; candidates: ModelCatalogEntry[] }
+  | { kind: "no_auth"; modelId: string }
+  | { kind: "failed" }
+  | { kind: "no_session" };
+
+/** Dependencies of {@link handlePiModelAutocomplete}. */
+export interface PiModelAutocompleteDeps {
+  /** Allow-list of Discord user ids. Empty/undefined = allow everyone. */
+  allowedUserIds?: string[];
+  /** The models the session can use. */
+  listModels: () => ModelLike[] | Promise<ModelLike[]>;
+  /** The id of the model the session currently uses. */
+  currentModelId?: () => string | null;
+  /**
+   * Is a Pi session bound?
+   *
+   * Optional — when it is missing the handler assumes a session. The
+   * runtime passes the real check so the hub mode offers no choices.
+   */
+  hasSession?: () => boolean;
+  /**
+   * A note rendered with the model list.
+   *
+   * Used when the session does not expose the model-scope API: the list is
+   * then *not* scope-filtered and the reply says so.
+   */
+  scopeNote?: () => string | null;
+}
+
+/** Dependencies of {@link handlePiModelInteraction}. */
+export interface PiModelInteractionDeps extends PiModelAutocompleteDeps {
+  /** The id of the model the session currently uses. */
+  currentModelId: () => string | null;
+  /** Switches the session to the given qualified model id. */
+  switchModel: (id: string) => Promise<PiModelSwitchOutcome> | PiModelSwitchOutcome;
+}
+
+/** Result of {@link handlePiModelInteraction} — safe to log. */
+export interface PiModelInteractionResult {
+  ok: boolean;
+  error?: string;
+}
+
+/** The model was switched. */
+export const PI_MODEL_SWITCHED_PREFIX = "✅ Model switched to";
+
+/** The provider has no configured credentials. */
+export const PI_MODEL_NO_AUTH_PREFIX = "⚠️ No API key configured for provider";
+
+/** The switch failed. */
+export const PI_MODEL_SWITCH_FAILED = "⚠️ Could not switch the model.";
+
+/** The bot is online, but no Pi session is connected. */
+export const PI_MODEL_NO_SESSION = "No Pi session is connected.";
+
+/** The model list could not be built. */
+export const PI_MODEL_UNAVAILABLE = "⚠️ Model list unavailable right now.";
+
+/** Discord's plain-message limit. */
+const PI_MESSAGE_MAX = 2000;
+
+/**
+ * Cut a reply to Discord's plain-message limit.
+ *
+ * A reply that is longer would be rejected by Discord — the user would see
+ * an API error instead of the explanation.
+ */
+function boundMessage(text: string): string {
+  if (typeof text !== "string") return "";
+  return text.length > PI_MESSAGE_MAX ? `${text.slice(0, PI_MESSAGE_MAX - 1)}…` : text;
+}
+
+/**
+ * Is a Pi session bound?
+ *
+ * The dependency is optional: when it is missing the handler assumes a
+ * session (the pure handlers stay easy to test). The runtime passes the
+ * real check, so the hub mode answers "no session connected".
+ */
+function hasSessionSafe(deps: { hasSession?: () => boolean }): boolean {
+  if (typeof deps.hasSession !== "function") return true;
+  try {
+    return deps.hasSession() === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Render an ambiguous selection — never switches a model.
+ *
+ * The user's input is **not** echoed: it is arbitrary text that could carry
+ * a secret (the bot token, the system prompt, file contents) and it could
+ * be long enough to break Discord's message limit. Only canonical catalog
+ * entries — the qualified ids of the session's own models — are rendered.
+ */
+function formatAmbiguousModels(selection: {
+  query: string;
+  candidates: ModelCatalogEntry[];
+}): string {
+  const lines: string[] = ["⚠️ That model id matches several models:"];
+  for (const candidate of selection.candidates.slice(0, MODEL_CANDIDATE_LIMIT)) {
+    lines.push(`• ${candidate.id} — ${candidate.name}`);
+  }
+  lines.push("Use the full provider/model-id, e.g. anthropic/claude-sonnet-4-5.");
+  return boundMessage(lines.join("\n"));
+}
+
+/**
+ * Render an unknown selection — never switches a model.
+ *
+ * The user's input is **not** echoed (see {@link formatAmbiguousModels}).
+ * The suggestions are canonical catalog entries.
+ */
+function formatUnknownModels(selection: {
+  query: string;
+  suggestions: ModelCatalogEntry[];
+}): string {
+  const lines: string[] = ["❌ Unknown model."];
+  const suggestions = selection.suggestions.slice(0, MODEL_CANDIDATE_LIMIT);
+  if (suggestions.length > 0) {
+    lines.push("Did you mean:");
+    for (const suggestion of suggestions) {
+      lines.push(`• ${suggestion.id} — ${suggestion.name}`);
+    }
+  }
+  lines.push("Use the qualified id, e.g. provider/model-id.");
+  return boundMessage(lines.join("\n"));
+}
+
+/**
+ * The provider of a failed switch.
+ *
+ * The outcome may carry the qualified id or the bare model id — the
+ * already-resolved entry is preferred, the id is parsed as a fallback.
+ */
+function providerOf(modelId: string, resolved: ModelCatalogEntry): string {
+  const raw = cleanText(modelId);
+  if (raw && resolved.modelId.toLowerCase() === raw.toLowerCase()) return resolved.provider;
+  if (raw) {
+    const slash = raw.indexOf("/");
+    if (slash > 0) return raw.slice(0, slash);
+    return raw;
+  }
+  return resolved.provider;
+}
+
+/** Render the outcome of a model switch. */
+function renderSwitchOutcome(
+  outcome: PiModelSwitchOutcome,
+  resolved: ModelCatalogEntry,
+): string {
+  if (!outcome || typeof outcome !== "object") return PI_MODEL_SWITCH_FAILED;
+
+  switch (outcome.kind) {
+    case "switched": {
+      const provider = cleanText(outcome.model?.provider) ?? resolved.provider;
+      const modelId = cleanText(outcome.model?.id) ?? resolved.modelId;
+      const name =
+        cleanText(outcome.model?.name) ?? cleanText(outcome.model?.id) ?? resolved.name;
+      // The switch applies to the running session only — the configured
+      // default model is not changed on Pi >= 1.5 (see the README).
+      return boundMessage(
+        `${PI_MODEL_SWITCHED_PREFIX} ${provider}/${modelId} — ${name} (this session)`,
+      );
+    }
+    case "unknown":
+      return formatUnknownModels({
+        query: outcome.query ?? "",
+        suggestions: outcome.suggestions ?? [],
+      });
+    case "ambiguous":
+      return formatAmbiguousModels({
+        query: outcome.query ?? "",
+        candidates: outcome.candidates ?? [],
+      });
+    case "no_auth": {
+      const provider = providerOf(outcome.modelId ?? "", resolved);
+      return boundMessage(
+        `${PI_MODEL_NO_AUTH_PREFIX} '${provider}' — the model was not switched.`,
+      );
+    }
+    case "no_session":
+      return PI_MODEL_NO_SESSION;
+    default:
+      return PI_MODEL_SWITCH_FAILED;
+  }
+}
+
+/**
+ * Handle a `/pi-model` interaction.
+ *
+ * Without the `model` option the usable models are listed (current model
+ * marked); with it the model is switched. An unknown or ambiguous input
+ * never switches anything and always explains what to do next.
+ *
+ * Every path is ephemeral: refusals, success and internal errors.
+ */
+export async function handlePiModelInteraction(
+  interaction: PiStatusInteraction,
+  deps: PiModelInteractionDeps,
+): Promise<PiModelInteractionResult> {
+  const allowed = deps.allowedUserIds;
+  if (Array.isArray(allowed) && allowed.length > 0 && !allowed.includes(interaction.user.id)) {
+    try {
+      await interaction.reply({ content: PI_STATUS_REFUSAL, ephemeral: true });
+    } catch (err) {
+      console.error(
+        "[pi-discord-remote] /pi-model: refusal reply failed:",
+        describeErrorSafely(err),
+      );
+      return { ok: false, error: "refusal_failed" };
+    }
+    return { ok: false, error: "not_allowed" };
+  }
+
+  // Acknowledge first: Discord only allows 3 seconds for the first reply.
+  try {
+    await interaction.deferReply({ ephemeral: true });
+  } catch (err) {
+    console.error("[pi-discord-remote] /pi-model: deferReply failed:", describeErrorSafely(err));
+    return { ok: false, error: "defer_failed" };
+  }
+
+  try {
+    // Hub mode: the bot is online, but no Pi session is bound — the plan
+    // answers "no session connected" for both new commands.
+    if (!hasSessionSafe(deps)) {
+      await interaction.editReply({ content: PI_MODEL_NO_SESSION });
+      return { ok: true };
+    }
+
+    const query = readStringOption(interaction, PI_MODEL_OPTION_NAME);
+    const models = await deps.listModels();
+    const catalog = buildModelCatalog(
+      models ?? [],
+      safeCurrentModelId(deps),
+      MODEL_DISPLAY_LIMIT,
+      safeScopeNote(deps) ?? undefined,
+    );
+
+    if (!query) {
+      // No argument: list the usable models.
+      const reply = buildModelListReply(catalog);
+      if (reply.embed) {
+        await interaction.editReply({ embeds: [reply.embed] });
+      } else {
+        await interaction.editReply({ content: reply.content ?? formatModelListText(catalog) });
+      }
+      return { ok: true };
+    }
+
+    const selection = resolveModelSelection(catalog, query);
+    if (selection.kind === "ambiguous") {
+      // Ambiguous input never switches a model.
+      await interaction.editReply({ content: formatAmbiguousModels(selection) });
+      return { ok: true };
+    }
+    if (selection.kind === "unknown") {
+      // Unknown input never switches a model.
+      await interaction.editReply({ content: formatUnknownModels(selection) });
+      return { ok: true };
+    }
+
+    const outcome = await deps.switchModel(selection.entry.id);
+    await interaction.editReply({ content: renderSwitchOutcome(outcome, selection.entry) });
+    return { ok: true };
+  } catch (err) {
+    // The detail stays in the local log — the Discord reply must never
+    // expose a stack trace, the bot token, the system prompt or file
+    // contents.
+    console.error("[pi-discord-remote] /pi-model: model command failed:", describeErrorSafely(err));
+    try {
+      await interaction.editReply({ content: PI_MODEL_UNAVAILABLE });
+    } catch {
+      /* the deferred reply is gone — nothing else we can do */
+    }
+    return { ok: false, error: "model_unavailable" };
+  }
+}
+
+// ─── /pi-model autocomplete ──────────────────────────────────────────────────
+
+/** Discord allows at most 25 autocomplete choices per answer. */
+export const PI_MODEL_AUTOCOMPLETE_MAX = 25;
+
+/** Discord allows at most 100 characters per autocomplete choice. */
+const PI_MODEL_CHOICE_MAX = 100;
+
+/** One autocomplete choice. */
+export interface PiAutocompleteChoice {
+  name: string;
+  value: string;
+}
+
+/** The subset of a Discord autocomplete interaction this module uses. */
+export interface PiModelAutocompleteInteraction {
+  /** The invoking user. */
+  user: { id: string };
+  /** The options of the command (the focused one carries the typed text). */
+  options?: { getString(name: string): string | null; getFocused?(): string };
+  /** Answer the autocomplete request. */
+  respond(choices: PiAutocompleteChoice[]): Promise<unknown>;
+}
+
+/** Result of {@link handlePiModelAutocomplete} — safe to log. */
+export interface PiModelAutocompleteResult {
+  ok: boolean;
+  /** How many choices were sent. */
+  choices?: number;
+  error?: string;
+}
+
+/** The text the user typed so far. */
+function readAutocompleteValue(interaction: PiModelAutocompleteInteraction): string {
+  try {
+    const focused = interaction.options?.getFocused?.();
+    const value = cleanText(focused);
+    if (value) return value;
+  } catch {
+    /* fall through to getString */
+  }
+  try {
+    const value = cleanText(interaction.options?.getString?.(PI_MODEL_OPTION_NAME));
+    if (value) return value;
+  } catch {
+    /* no value at all */
+  }
+  return "";
+}
+
+/** Does the entry match the typed text? */
+function matchesAutocompleteQuery(entry: ModelCatalogEntry, query: string): boolean {
+  if (query.length === 0) return true;
+  return (
+    entry.id.toLowerCase().includes(query) ||
+    entry.modelId.toLowerCase().includes(query) ||
+    entry.name.toLowerCase().includes(query)
+  );
+}
+
+/**
+ * Answer the `/pi-model` autocomplete request.
+ *
+ * The candidates are filtered by the typed text and answered with at most
+ * 25 choices of `provider/model-id`. The handler never throws: a failure
+ * answers with an empty list.
+ */
+export async function handlePiModelAutocomplete(
+  interaction: PiModelAutocompleteInteraction,
+  deps: PiModelAutocompleteDeps,
+): Promise<PiModelAutocompleteResult> {
+  try {
+    const allowed = deps.allowedUserIds;
+    if (Array.isArray(allowed) && allowed.length > 0 && !allowed.includes(interaction.user.id)) {
+      await interaction.respond([]);
+      return { ok: true, choices: 0 };
+    }
+
+    // Hub mode: no session is bound, so there is no inventory to offer.
+    if (!hasSessionSafe(deps)) {
+      await interaction.respond([]);
+      return { ok: true, choices: 0 };
+    }
+
+    const models = await deps.listModels();
+    const catalog = buildModelCatalog(models ?? [], safeCurrentModelId(deps));
+    const query = readAutocompleteValue(interaction).toLowerCase();
+
+    const choices = catalog.entries
+      .filter((entry) => matchesAutocompleteQuery(entry, query))
+      // Discord's choice value is limited to 100 characters. An entry whose
+      // qualified id does not fit is skipped instead of being truncated into
+      // a value that could never resolve to a model.
+      .filter((entry) => entry.id.length <= PI_MODEL_CHOICE_MAX)
+      .slice(0, PI_MODEL_AUTOCOMPLETE_MAX)
+      .map((entry) => ({
+        name: `${entry.id} — ${entry.name}`.slice(0, PI_MODEL_CHOICE_MAX),
+        value: entry.id,
+      }));
+
+    await interaction.respond(choices);
+    return { ok: true, choices: choices.length };
+  } catch (err) {
+    console.error(
+      "[pi-discord-remote] /pi-model: autocomplete failed:",
+      describeErrorSafely(err),
+    );
+    try {
+      await interaction.respond([]);
+    } catch {
+      /* the interaction is gone — nothing else we can do */
+    }
+    return { ok: false, error: "autocomplete_failed" };
   }
 }

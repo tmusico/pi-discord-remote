@@ -18,8 +18,10 @@
  *   /pi-discord-remote status      — show connection state
  *   /pi-discord-remote open-config — edit config.json in the editor
  *
- * Discord slash command (guild-scoped, ephemeral replies):
+ * Discord slash commands (guild-scoped, ephemeral replies):
  *   /pi-status                     — live snapshot of the Pi session
+ *   /pi-abort                      — stop the running agent turn (session stays alive)
+ *   /pi-model                      — list the usable models / switch the active model
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -49,15 +51,41 @@ import {
 } from "./helpers.js";
 import { buildStatusView, type SessionState, type StatusState } from "./status.js";
 import {
+  MODEL_SCOPE_NOTE_UNAVAILABLE,
+  type ModelLike,
+  type ModelScopeKind,
+} from "./model-control.js";
+import {
+  handlePiAbortInteraction,
+  handlePiModelAutocomplete,
+  handlePiModelInteraction,
   handlePiStatusInteraction,
-  registerPiStatusCommand,
+  registerPiCommands,
+  PI_ABORT_COMMAND,
+  PI_ABORT_COMMAND_NAME,
+  PI_MODEL_COMMAND,
+  PI_MODEL_COMMAND_NAME,
+  PI_STATUS_COMMAND,
   PI_STATUS_COMMAND_NAME,
+  type PiAbortOutcome,
+  type PiModelSwitchOutcome,
 } from "./slash.js";
 
 // ─── Reconnection constants ──────────────────────────────────────────────────
 const RECONNECT_BASE_DELAY_MS = 2_000;
 const RECONNECT_MAX_DELAY_MS = 60_000;
 const RECONNECT_MAX_ATTEMPTS = 10;
+
+/**
+ * The Discord slash commands this extension owns.
+ *
+ * They are registered together (idempotently, upsert by name) — the
+ * guild's other commands are never touched.
+ */
+const PI_SLASH_COMMANDS = [PI_STATUS_COMMAND, PI_ABORT_COMMAND, PI_MODEL_COMMAND] as const;
+
+/** The command names, as rendered in the registration warnings. */
+const PI_SLASH_COMMAND_NAMES = PI_SLASH_COMMANDS.map((command) => `/${command.name}`).join(", ");
 
 // ─── Git lookup constants (for /pi-status) ───────────────────────────────────
 /** Hard timeout of a single git invocation. */
@@ -400,6 +428,454 @@ export function readAgentIdleSafe(ctx: unknown): boolean | null {
   if (!ctx) return null;
   const idle = safeCall(() => (ctx as { isIdle?: () => unknown }).isIdle?.(), null);
   return typeof idle === "boolean" ? idle : null;
+}
+
+// ─── Model helpers (stale-ctx safe — unit-tested) ───────────────────────────
+
+/** The minimal shape of a Pi model object (as returned by the registry). */
+interface PiModelShape {
+  provider?: unknown;
+  id?: unknown;
+  name?: unknown;
+}
+
+/**
+ * Map a raw Pi model object to the {@link ModelLike} shape.
+ *
+ * Returns `null` when the model has no provider or no id — such a model
+ * cannot be addressed as `provider/model-id`, so it is never rendered.
+ */
+export function toModelLike(model: unknown): ModelLike | null {
+  if (!model || typeof model !== "object") return null;
+  const raw = model as PiModelShape;
+  const provider = typeof raw.provider === "string" ? raw.provider.trim() : "";
+  const id = typeof raw.id === "string" ? raw.id.trim() : "";
+  if (!provider || !id) return null;
+  const name = typeof raw.name === "string" ? raw.name.trim() : "";
+  return name ? { provider, id, name } : { provider, id };
+}
+
+/**
+ * The qualified id (`provider/model-id`) of a model.
+ *
+ * `null` when the model has no provider or no id.
+ */
+export function qualifiedModelId(model: unknown): string | null {
+  const like = toModelLike(model);
+  return like ? `${like.provider}/${like.id}` : null;
+}
+
+/**
+ * Read the session's scoped models (the `--models` / `enabledModels` scope).
+ *
+ * Every entry is `{ model, thinkingLevel? }` — only the model object is
+ * used. A stale ctx (one that throws after a session replacement or a
+ * reload) degrades to an empty list instead of throwing inside a Discord
+ * interaction.
+ */
+export function readScopedModelsSafe(ctx: unknown): unknown[] {
+  const scoped = readScopedModelsProperty(ctx);
+  return scoped ? scopedModelObjects(scoped) : [];
+}
+
+/**
+ * The raw `scopedModels` property of the ctx.
+ *
+ * `undefined` means the property does not exist — an older Pi without the
+ * scope API. An array (even an empty one) means the API exists: an empty
+ * scope is Pi's "no scoping configured", which is *not* the same as a
+ * missing API.
+ */
+function readScopedModelsProperty(ctx: unknown): unknown[] | undefined {
+  if (!ctx) return undefined;
+  const scoped = safeCall(() => (ctx as { scopedModels?: unknown }).scopedModels, undefined);
+  return Array.isArray(scoped) ? scoped : undefined;
+}
+
+/** The model objects of the scoped entries. */
+function scopedModelObjects(scoped: unknown[]): unknown[] {
+  const models: unknown[] = [];
+  for (const entry of scoped) {
+    if (!entry || typeof entry !== "object") continue;
+    // The scoped entries wrap the model — a bare model object is accepted
+    // as well, so a future scope shape cannot break the list.
+    const inner = (entry as { model?: unknown }).model ?? entry;
+    if (inner && typeof inner === "object") models.push(inner);
+  }
+  return models;
+}
+
+/**
+ * Read the registry's available models, filtered by the configured auth.
+ *
+ * A model whose provider has no credentials is never offered — switching
+ * to it could not work. A stale ctx degrades to an empty list.
+ */
+export function readAvailableModelsSafe(ctx: unknown): unknown[] {
+  if (!ctx) return [];
+  const registry = safeCall(
+    () => (ctx as { modelRegistry?: unknown }).modelRegistry,
+    undefined,
+  );
+  if (!registry || typeof registry !== "object") return [];
+
+  const r = registry as {
+    getAvailable?: () => unknown;
+    hasConfiguredAuth?: (model: unknown) => unknown;
+  };
+  const available = safeCall(() => r.getAvailable?.(), undefined);
+  if (!Array.isArray(available)) return [];
+
+  const models: unknown[] = [];
+  for (const model of available) {
+    if (!model || typeof model !== "object") continue;
+    if (typeof r.hasConfiguredAuth === "function") {
+      // The method is called **on the registry** so it keeps its receiver:
+      // the real `ModelRegistry.hasConfiguredAuth()` reads `this.authStorage`
+      // and `this.providerRequestConfigs`. An unbound call throws, the
+      // guarded call swallows it and every model would be filtered out.
+      const hasAuth = safeCall(() => r.hasConfiguredAuth?.(model), false);
+      if (!hasAuth) continue;
+    }
+    models.push(model);
+  }
+  return models;
+}
+
+/**
+ * The raw model objects the session can use plus how the scope was found.
+ *
+ * Three distinct cases:
+ *   • the scope API exists and the scope is non-empty → the scoped models,
+ *   • the scope API exists but the scope is empty → "no scoping configured",
+ *     so every model with a configured auth is usable,
+ *   • the scope API does not exist (an older Pi) → the same fallback, but
+ *     the list is *not* scope-filtered and the caller says so.
+ */
+function readRawModelScope(ctx: unknown): { kind: ModelScopeKind; models: unknown[] } {
+  const scoped = readScopedModelsProperty(ctx);
+  if (scoped) {
+    const scopedModels = scopedModelObjects(scoped);
+    if (scopedModels.length > 0) return { kind: "scoped", models: scopedModels };
+    // An empty scope means "no scoping configured" → everything is usable.
+    return { kind: "unscoped", models: readAvailableModelsSafe(ctx) };
+  }
+  // The scope API does not exist — the list is not scope-filtered.
+  return { kind: "unavailable", models: readAvailableModelsSafe(ctx) };
+}
+
+/**
+ * The raw model objects the session can use.
+ *
+ * The scoped models win when the session has any (an empty scope means
+ * "no scoping → everything is usable"); otherwise the registry's
+ * available models are used, filtered by the configured auth.
+ */
+export function readRawModelsSafe(ctx: unknown): unknown[] {
+  return readRawModelScope(ctx).models;
+}
+
+/** The models the session can use, as {@link ModelLike} entries. */
+export function readModelsSafe(ctx: unknown): ModelLike[] {
+  return readRawModelsSafe(ctx)
+    .map(toModelLike)
+    .filter((model): model is ModelLike => model !== null);
+}
+
+/** The model scope of the session plus how it was determined. */
+export interface ModelScope {
+  /** How the scope was determined. */
+  kind: ModelScopeKind;
+  /** The models the session can use. */
+  models: ModelLike[];
+  /**
+   * The note shown when the list is *not* scope-filtered (an older Pi
+   * without the scope API).
+   */
+  note?: string;
+}
+
+/**
+ * The models the session can use plus how the model scope was determined.
+ *
+ * The scope API is feature-detected — it only exists on newer Pi
+ * versions. When it is missing the reply says so instead of pretending
+ * that a scope was applied.
+ */
+export function readModelScopeSafe(ctx: unknown): ModelScope {
+  const scope = readRawModelScope(ctx);
+  const models = scope.models
+    .map(toModelLike)
+    .filter((model): model is ModelLike => model !== null);
+  const note =
+    scope.kind === "unavailable" && models.length > 0 ? MODEL_SCOPE_NOTE_UNAVAILABLE : undefined;
+  return { kind: scope.kind, models, note };
+}
+
+/**
+ * The live model of the session (null when the ctx is stale/unavailable).
+ */
+export function readCurrentModelSafe(ctx: unknown): ModelLike | null {
+  if (!ctx) return null;
+  const model = safeCall(() => (ctx as { model?: unknown }).model, undefined);
+  return toModelLike(model);
+}
+
+/**
+ * The qualified id (`provider/model-id`) of the active model.
+ *
+ * The live ctx model wins; the model tracked by the `model_select` event
+ * is the fallback.
+ */
+export function resolveCurrentModelId(
+  live: ModelLike | null | undefined,
+  tracked: { provider?: string; id?: string } | null | undefined,
+): string | null {
+  return qualifiedModelId(live ?? null) ?? qualifiedModelId(tracked ?? null);
+}
+
+/**
+ * Find the model object with the given qualified id.
+ *
+ * The lookup is case-insensitive and matches the *whole* qualified id.
+ */
+export function findModelByQualifiedId(
+  models: unknown[],
+  qualifiedId: string,
+): unknown | null {
+  const wanted = typeof qualifiedId === "string" ? qualifiedId.trim().toLowerCase() : "";
+  if (!wanted) return null;
+  for (const model of Array.isArray(models) ? models : []) {
+    const id = qualifiedModelId(model);
+    if (id && id.toLowerCase() === wanted) return model;
+  }
+  return null;
+}
+
+/**
+ * Is the captured ctx still usable?
+ *
+ * A captured ctx throws on every access after a session replacement or a
+ * reload — the probe detects that without letting the error escape.
+ */
+export function isContextUsable(ctx: unknown): boolean {
+  if (!ctx || typeof ctx !== "object") return false;
+  try {
+    const probe = (ctx as { isIdle?: unknown }).isIdle;
+    if (typeof probe !== "function") return false;
+    (probe as () => unknown).call(ctx);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ─── Abort outcome (pure — unit-tested) ─────────────────────────────────────
+
+/** The signals that decide what an abort attempt does. */
+export interface AbortStateInput {
+  /** Is Discord connected *and* bound to a Pi session? */
+  hasSession: boolean;
+  /** Is the captured ctx still usable (a stale ctx throws)? */
+  ctxUsable: boolean;
+  /** Is the agent currently running a turn? */
+  agentBusy: boolean;
+  /** Is the agent idle (null = unknown)? */
+  agentIdle: boolean | null;
+}
+
+/**
+ * The outcome of an abort attempt.
+ *
+ * The order is fixed: no session → unsupported session → idle → aborted.
+ * Only a *running* turn is aborted — the session, the channel and the bot
+ * connection always survive.
+ */
+export function resolveAbortOutcome(input: AbortStateInput): PiAbortOutcome {
+  if (!input.hasSession) return { kind: "no_session" };
+  if (!input.ctxUsable) return { kind: "unsupported" };
+  const running = input.agentBusy || input.agentIdle === false;
+  return { kind: running ? "aborted" : "idle" };
+}
+
+// ─── Runtime seams (injectable — unit-tested) ──────────────────────────────
+
+/**
+ * Short, leak-free description of an unknown error.
+ *
+ * Only a **fixed** category is kept — never the message, the stack, the body
+ * and never `err.name` either: `name` is a writable property, so a provider
+ * error could carry any text in it (the bot token, the system prompt, file
+ * contents). The built-in error classes are recognized through `instanceof`
+ * (their prototype chain cannot be forged by assigning a property), so the
+ * returned category always comes from this fixed vocabulary.
+ */
+export function describeErrorName(err: unknown): string {
+  if (err instanceof TypeError) return "TypeError";
+  if (err instanceof RangeError) return "RangeError";
+  if (err instanceof ReferenceError) return "ReferenceError";
+  if (err instanceof SyntaxError) return "SyntaxError";
+  if (err instanceof Error) return "Error";
+  if (typeof err === "string") return "Error";
+  return "unknown_error";
+}
+
+/** The dependencies of {@link abortSessionRun}. */
+export interface AbortRunDeps {
+  /** Is Discord connected *and* bound to a Pi session? */
+  hasSession: () => boolean;
+  /** Is the agent currently running a turn? */
+  isBusy: () => boolean;
+  /** The captured Pi context (may be stale — it throws on every access). */
+  ctx: unknown;
+  /** Rejects a pending Discord question. */
+  cancelQuestion: () => void;
+}
+
+/**
+ * Abort the running agent turn.
+ *
+ * Only the *run* is stopped — the session, the channel and the bot
+ * connection stay alive. A pending Discord question is rejected first:
+ * otherwise the turn would keep waiting for an answer that will never
+ * come. `ctx.abort()` is called for the `aborted` outcome only.
+ */
+export function abortSessionRun(deps: AbortRunDeps): PiAbortOutcome {
+  const ctx = deps.ctx;
+  const outcome = resolveAbortOutcome({
+    hasSession: deps.hasSession(),
+    ctxUsable: Boolean(ctx) && isContextUsable(ctx),
+    agentBusy: deps.isBusy(),
+    agentIdle: ctx ? readAgentIdleSafe(ctx) : null,
+  });
+
+  if (outcome.kind !== "aborted" || !ctx) return outcome;
+
+  // Reject a pending Discord question first — the turn must not keep
+  // waiting for an answer that will never come.
+  deps.cancelQuestion();
+
+  try {
+    (ctx as { abort?: () => void }).abort?.();
+  } catch (err) {
+    // The ctx went stale between the probe and the abort — the run is
+    // over either way. Only the error *name* is logged.
+    console.error("[pi-discord-remote] /pi-abort: abort failed:", describeErrorName(err));
+  }
+  return { kind: "aborted" };
+}
+
+/** The dependencies of {@link performModelSwitch}. */
+export interface ModelSwitchDeps {
+  /** Is Discord connected *and* bound to a Pi session? */
+  hasSession?: () => boolean;
+  /**
+   * Switches the session to the given model object.
+   *
+   * Resolves to `false` when the provider has no configured credentials.
+   */
+  setModel: (model: unknown) => Promise<boolean> | boolean;
+  /** The model objects the session knows. */
+  candidates: unknown[];
+  /** The qualified id (`provider/model-id`) the user asked for. */
+  qualifiedId: string;
+}
+
+/**
+ * Switch the session to a model.
+ *
+ * The model object is resolved from the session's own candidate list — an
+ * unknown id never reaches `setModel`. A `false` answer means "no API
+ * key"; a thrown error is reported as `failed` — the raw provider error
+ * never reaches the return value.
+ */
+export async function performModelSwitch(
+  deps: ModelSwitchDeps,
+): Promise<PiModelSwitchOutcome> {
+  const target = typeof deps.qualifiedId === "string" ? deps.qualifiedId.trim() : "";
+  if (!target) return { kind: "failed" };
+  // Hub mode: the bot is online, but no session is bound — there is
+  // nothing to re-model.
+  if (deps.hasSession && !deps.hasSession()) return { kind: "no_session" };
+
+  const model = findModelByQualifiedId(deps.candidates ?? [], target);
+  if (!model) return { kind: "failed" };
+
+  const like = toModelLike(model);
+  try {
+    const switched = await deps.setModel(model);
+    // `setModel` returns false when the provider has no credentials.
+    if (!switched) return { kind: "no_auth", modelId: target };
+    return {
+      kind: "switched",
+      model: like ?? { provider: target.split("/")[0] ?? "", id: target },
+    };
+  } catch (err) {
+    // The raw provider error never reaches Discord — only its name is
+    // logged locally.
+    console.error("[pi-discord-remote] /pi-model: switch failed:", describeErrorName(err));
+    return { kind: "failed" };
+  }
+}
+
+/** The subset of a Discord interaction the router uses. */
+export interface PiRoutableInteraction {
+  /** Is this an autocomplete interaction? */
+  isAutocomplete?: () => boolean;
+  /** Is this a chat-input command interaction? */
+  isChatInputCommand?: () => boolean;
+  /** The name of the invoked command. */
+  commandName?: string;
+}
+
+/** The handlers the interaction router dispatches to. */
+export interface PiInteractionHandlers {
+  /** Handles a `/pi-status` interaction. */
+  status?: (interaction: any) => unknown;
+  /** Handles a `/pi-abort` interaction. */
+  abort?: (interaction: any) => unknown;
+  /** Handles a `/pi-model` interaction. */
+  model?: (interaction: any) => unknown;
+  /** Handles a `/pi-model` autocomplete interaction. */
+  modelAutocomplete?: (interaction: any) => unknown;
+}
+
+/**
+ * Route a Discord interaction to the Pi slash-command handlers.
+ *
+ * The autocomplete branch comes **first**: an autocomplete interaction only
+ * supports `respond()` — it must never reach a chat-input handler. Every
+ * other interaction is ignored: the extension never answers a command it
+ * does not know, and the interaction is never injected into the Pi
+ * session.
+ */
+export async function routePiInteraction(
+  interaction: PiRoutableInteraction,
+  handlers: PiInteractionHandlers,
+): Promise<void> {
+  if (interaction.isAutocomplete?.()) {
+    if (interaction.commandName === PI_MODEL_COMMAND_NAME) {
+      await handlers.modelAutocomplete?.(interaction);
+    }
+    return;
+  }
+
+  if (!interaction.isChatInputCommand?.()) return;
+
+  switch (interaction.commandName) {
+    case PI_STATUS_COMMAND_NAME:
+      await handlers.status?.(interaction);
+      return;
+    case PI_ABORT_COMMAND_NAME:
+      await handlers.abort?.(interaction);
+      return;
+    case PI_MODEL_COMMAND_NAME:
+      await handlers.model?.(interaction);
+      return;
+    default:
+      // An unknown command is never answered.
+      return;
+  }
 }
 
 // ─── Setup config (pure — unit-tested) ──────────────────────────────────────
@@ -1001,7 +1477,7 @@ export default function (pi: ExtensionAPI) {
 
       // The guild command may have been deleted meanwhile — re-registering is
       // idempotent and never replaces the guild's other commands.
-      await registerStatusCommand(client, cfg, notify, setStatus);
+      await registerSlashCommands(client, cfg, notify, setStatus);
 
       // Successfully reconnected — restore channel reference
       reconnectAttempt = 0;
@@ -1202,52 +1678,180 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // ── Session control (/pi-abort, /pi-model) ─────────────────────────────────
+
   /**
-   * Route Discord interactions to the `/pi-status` handler.
+   * Abort the running agent turn.
+   *
+   * Only the *run* is stopped — the session, the channel and the bot
+   * connection stay alive. A pending Discord question is rejected first:
+   * otherwise the turn would keep waiting for an answer that will never
+   * come.
+   */
+  function abortCurrentRun(): PiAbortOutcome {
+    return abortSessionRun({
+      hasSession: hasActiveSession,
+      isBusy: () => agentBusy,
+      ctx: capturedCtx,
+      cancelQuestion: cancelPendingQuestion,
+    });
+  }
+
+  /**
+   * The models the session can use.
+   *
+   * The inventory is read-only, so it is also rendered in hub mode — the
+   * same model the `/pi-status` snapshot shows. Switching is what needs a
+   * live session (see {@link switchSessionModel}).
+   */
+  function listSessionModels(): ModelLike[] {
+    return readModelScopeSafe(capturedCtx).models;
+  }
+
+  /**
+   * The note rendered with the model list.
+   *
+   * It is set when the session does not expose the model-scope API (an
+   * older Pi): the list is then *not* scope-filtered and the reply says
+   * so instead of pretending that a scope was applied.
+   */
+  function modelScopeNote(): string | null {
+    return readModelScopeSafe(capturedCtx).note ?? null;
+  }
+
+  /**
+   * The qualified id (`provider/model-id`) of the active model.
+   */
+  function currentModelId(): string | null {
+    return resolveCurrentModelId(readCurrentModelSafe(capturedCtx), activeModel);
+  }
+
+  /**
+   * Switch the session to the given qualified model id.
+   *
+   * The model object is resolved from the session's own candidate list, so
+   * `pi.setModel()` always receives a model the session knows. The switch
+   * is picked up by the `model_select` event, so `/pi-status` shows the
+   * new model right away.
+   */
+  async function switchSessionModel(qualifiedId: string): Promise<PiModelSwitchOutcome> {
+    const ctx = capturedCtx;
+    if (!ctx || !isContextUsable(ctx)) return { kind: "no_session" };
+
+    return performModelSwitch({
+      hasSession: hasActiveSession,
+      setModel: (model) =>
+        // Version dependency: on Pi >= 1.5 `AgentSession.setModel(model,
+        // options)` persists the *global default* model only when
+        // `options.persist === true`. The extension API's `pi.setModel(model)`
+        // does not set that option — so on Pi >= 1.5 the configured default
+        // model is NOT changed. Older Pi versions (< 1.5) persisted the
+        // switch unconditionally.
+        pi.setModel(model as Parameters<typeof pi.setModel>[0]),
+      candidates: readRawModelsSafe(ctx),
+      qualifiedId,
+    });
+  }
+
+  /**
+   * Route Discord interactions to the Pi slash-command handlers.
    *
    * Registered in exactly one place so both the initial connect and the
-   * reconnect path get it. Every other interaction is ignored — the
+   * reconnect path get it. The autocomplete branch comes **first**: an
+   * autocomplete interaction only supports `respond()` — it must never
+   * reach a chat-input handler. Every other interaction is ignored — the
    * extension never answers a command it does not know, and the
    * interaction is never injected into the Pi session.
    */
   function attachInteractionHandler(c: Client): void {
     c.on("interactionCreate", async (interaction) => {
       try {
-        if (!interaction.isChatInputCommand()) return;
-        if (interaction.commandName !== PI_STATUS_COMMAND_NAME) return;
-        await handlePiStatusInteraction(interaction, {
-          allowedUserIds: activeConfig?.allowedUserIds,
-          buildState: buildStatusState,
+        await routePiInteraction(interaction as unknown as PiRoutableInteraction, {
+          modelAutocomplete: (autocompleteInteraction) =>
+            handlePiModelAutocomplete(autocompleteInteraction, {
+              allowedUserIds: activeConfig?.allowedUserIds,
+              listModels: listSessionModels,
+              currentModelId,
+              hasSession: hasActiveSession,
+            }),
+          status: (statusInteraction) =>
+            handlePiStatusInteraction(statusInteraction, {
+              allowedUserIds: activeConfig?.allowedUserIds,
+              buildState: buildStatusState,
+            }),
+          abort: (abortInteraction) =>
+            handlePiAbortInteraction(abortInteraction, {
+              allowedUserIds: activeConfig?.allowedUserIds,
+              abortRun: abortCurrentRun,
+            }),
+          model: (modelInteraction) =>
+            handlePiModelInteraction(modelInteraction, {
+              allowedUserIds: activeConfig?.allowedUserIds,
+              listModels: listSessionModels,
+              currentModelId,
+              scopeNote: modelScopeNote,
+              hasSession: hasActiveSession,
+              switchModel: switchSessionModel,
+            }),
         });
       } catch (err) {
-        console.error("[pi-discord-remote] /pi-status interaction failed:", err);
+        // Only the error *name* is logged — never the message, the stack,
+        // the body or the raw error object.
+        console.error("[pi-discord-remote] Slash interaction failed:", describeErrorName(err));
       }
     });
   }
 
   /**
-   * Register the `/pi-status` slash command in the configured guild.
+   * Register the Pi slash commands in the configured guild.
    *
-   * Idempotent — it edits the existing command instead of replacing the
-   * guild's whole command set. A failure is never fatal: the extension keeps
-   * working, it just cannot answer `/pi-status` until the bot has been
-   * re-invited with the `applications.commands` scope.
+   * Idempotent — every command is edited in place when it already exists,
+   * so the guild's other commands are never touched. A failure is never
+   * fatal: the extension keeps working, it just cannot answer the
+   * commands until the bot has been re-invited with the
+   * `applications.commands` scope.
    */
-  async function registerStatusCommand(
+  async function registerSlashCommands(
     c: Client,
     cfg: Config,
     notifyFn: (msg: string, level: "success" | "error" | "warning" | "info") => void,
     setStatusFn: (key: string, val: string | undefined) => void,
   ): Promise<void> {
     try {
-      const result = await registerPiStatusCommand(c, cfg.token, cfg.guildId);
-      if (result.ok) return;
-      const detail = result.hint ? `${result.error} — ${result.hint}` : result.error;
-      console.error(`[pi-discord-remote] Could not register /pi-status: ${detail}`);
-      notifyFn(`⚠️ Could not register /pi-status: ${detail}`, "warning");
-      setStatusFn("pi-discord-remote", "⚠️ Discord: /pi-status unavailable");
+      const result = await registerPiCommands(c, cfg.token, cfg.guildId, PI_SLASH_COMMANDS);
+
+      // Every command reports its own outcome — one broken command must not
+      // hide the others.
+      const failed = result.outcomes.filter((outcome) => !outcome.ok);
+      if (failed.length > 0) {
+        for (const outcome of failed) {
+          const detail = outcome.hint ? `${outcome.error} — ${outcome.hint}` : outcome.error;
+          console.error(`[pi-discord-remote] Could not register /${outcome.name}: ${detail}`);
+          notifyFn(`⚠️ Could not register /${outcome.name}: ${detail}`, "warning");
+        }
+        setStatusFn(
+          "pi-discord-remote",
+          `⚠️ Discord: /${failed.map((outcome) => outcome.name).join(", ")} unavailable`,
+        );
+        return;
+      }
+
+      if (!result.ok) {
+        // The guild's commands could not be fetched at all.
+        const detail = result.hint ? `${result.error} — ${result.hint}` : result.error;
+        console.error(
+          `[pi-discord-remote] Could not register ${PI_SLASH_COMMAND_NAMES}: ${detail}`,
+        );
+        notifyFn(`⚠️ Could not register ${PI_SLASH_COMMAND_NAMES}: ${detail}`, "warning");
+        setStatusFn("pi-discord-remote", "⚠️ Discord: slash commands unavailable");
+      }
     } catch (err) {
-      console.error("[pi-discord-remote] Could not register /pi-status:", err);
+      // Only the error *name* is logged — never the message, the stack,
+      // the body or the raw error object.
+      console.error(
+        "[pi-discord-remote] Could not register the Pi slash commands:",
+        describeErrorName(err),
+      );
     }
   }
 
@@ -1384,9 +1988,10 @@ export default function (pi: ExtensionAPI) {
       await client.login(cfg.token);
       await readyPromise;
 
-      // Register the /pi-status slash command (guild-scoped, idempotent).
-      // A failure is not fatal — the extension keeps working without it.
-      await registerStatusCommand(client, cfg, notifyFn, setStatusFn);
+      // Register the /pi-status, /pi-abort and /pi-model slash commands
+      // (guild-scoped, idempotent). A failure is not fatal — the extension
+      // keeps working without them.
+      await registerSlashCommands(client, cfg, notifyFn, setStatusFn);
     } catch (err: any) {
       // Initial login failure — clean up and notify immediately
       console.error("[pi-discord-remote] Initial login failed:", err.message);

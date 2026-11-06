@@ -21,10 +21,10 @@ pi install npm:pi-discord-remote
    - Send Messages
    - Add Reactions
    - **Manage Channels** ← required for auto-create/delete
-4. Invite the bot with the **`applications.commands`** scope as well — the `/pi-status`
-   slash command only appears when the bot was invited with that scope. Re-invite it once
-   with this URL (`<APP_ID>` is the **Application ID** from the Developer Portal, not the bot
-   user id):
+4. Invite the bot with the **`applications.commands`** scope as well — the `/pi-status`,
+   `/pi-abort` and `/pi-model` slash commands only appear when the bot was invited with that
+   scope. Re-invite it once with this URL (`<APP_ID>` is the **Application ID** from the
+   Developer Portal, not the bot user id):
 
    ```
    https://discord.com/oauth2/authorize?client_id=<APP_ID>&scope=bot%20applications.commands&permissions=274145945856
@@ -57,12 +57,75 @@ injects anything into the Pi session and never prints the bot token, the system 
 file contents. A failed or aborted turn is reported as a generic label (`aborted`,
 `turn failed`) — the provider's raw error text stays in the local log.
 
+### `/pi-abort` (Discord slash command)
+
+Stops the **running agent turn** — the same effect as pressing Escape in the Pi TUI. The Pi
+session, the Discord channel and the bot connection all stay alive, so the session can be used
+again right after the abort. The reply is **ephemeral** and says exactly what happened:
+
+| Reply | Meaning |
+|-------|---------|
+| 🛑 Aborted the current run. The session is still connected. | A turn was running and has been stopped |
+| Nothing is running — there is nothing to abort. | The session is idle |
+| No Pi session is connected. | Hub mode — the bot is online, but no session is bound |
+| ⚠️ The session is not available right now. | The session was replaced or reloaded |
+
+A pending `discord_ask_user_question` is rejected first, so a turn that waits for an answer
+cannot hang after the abort.
+
+### `/pi-model` (Discord slash command)
+
+Lists the models the session can use — or switches to one. The reply is **ephemeral**.
+
+- `/pi-model` (no argument) — an embed that lists the usable models (up to 20 entries and
+  Discord's embed budget; entries that do not fit are left out). The current model is marked
+  with ✅ and the total count is stated when the list does not fit.
+- `/pi-model anthropic/claude-sonnet-4-5` — switches the session to that model. A bare model id
+  (`claude-sonnet-4-5`) is accepted when it is unique; the option autocompletes with the
+  qualified `provider/model-id` values.
+
+The candidate list is the session's own model scope when it has one (`--models` /
+`enabledModels`), otherwise every model of the registry that has an API key configured — in that
+fallback a model without credentials is never offered. An explicitly scoped model is kept as it
+is, so selecting one without credentials reports the missing API key instead of staying hidden.
+The scope API is feature-detected: on an older Pi that does not expose it, the list is **not**
+scope-filtered and the reply says so (“scope API unavailable — showing all authenticated
+models”).
+
+| Reply | Meaning |
+|-------|---------|
+| ✅ Model switched to provider/model-id — Name (this session) | The switch worked (it is recorded in the session history, so it survives a resume) |
+| ❌ Unknown model. | The id matched nothing — nothing was switched (up to 5 similar ids are suggested) |
+| ⚠️ That model id matches several models: … | The id was ambiguous — use the full `provider/model-id` |
+| ⚠️ No API key configured for provider '…' — the model was not switched. | The provider has no credentials |
+| ⚠️ Could not switch the model. | The switch failed (provider details are suppressed — only a generic error category is logged locally) |
+| No Pi session is connected. | Hub mode — the bot is online, but no session is bound |
+
+The typed id is never echoed back — only the canonical `provider/model-id` values of the
+session's own models are shown, so a pasted secret can never end up in a reply.
+
+The switch applies to the **running session**. Whether it also changes the *configured* default
+model depends on the Pi version:
+
+- **Pi ≥ 1.5** — the configured default model is **not** changed. The session only persists the
+  global default when the switch is explicitly persisted, and the slash command does not do
+  that.
+- **Older Pi versions (< 1.5)** — the same call persisted the change unconditionally, so the
+  configured default model may become the selected one.
+
+The reply always states “(this session)” so the scope of the change is never ambiguous.
+
+Both new commands honour the same `allowedUserIds` allow-list as `/pi-status`: a user outside
+the list gets a short refusal and nothing else.
+
 ### Hub mode (bot online without a session)
 
 `/pi-discord-remote stop` ends the *session* but keeps the Discord connection alive, so
 `/pi-status` can still answer with **“no session connected”** (and the reconnect logic keeps
 working). In hub mode the extension ignores every channel message — there is no session
-channel, so nothing is injected into Pi.
+channel, so nothing is injected into Pi. `/pi-abort` and `/pi-model` answer **“No Pi session is
+connected.”** in hub mode as well — there is no remote session to stop or re-model, and the
+model list is only available for a bound session.
 
 - `/pi-discord-remote disconnect` — log out completely (destroys the Discord client).
 - `/pi-discord-remote start` while in hub mode — reconnects and creates a fresh session channel.

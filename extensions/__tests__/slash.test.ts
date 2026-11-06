@@ -3,6 +3,7 @@ import type { ChatInputCommandInteraction, Client } from "discord.js";
 
 import {
   PI_STATUS_COMMAND,
+  REGISTRATION_FAILED_CODE,
   buildPiStatusInviteUrl,
   handlePiStatusInteraction,
   isMissingCommandScopeError,
@@ -219,7 +220,10 @@ describe("registerPiStatusCommand", () => {
     const result = await registerPiStatusCommand(client, SECRET_TOKEN, "guild-1");
 
     expect(result.ok).toBe(false);
-    expect(result.error).toContain("network down");
+    // The failure is reported as a fixed, leak-free code — the raw error
+    // message never leaves the module.
+    expect(result.error).toBe(REGISTRATION_FAILED_CODE);
+    expect(result.error).not.toContain("network down");
     expect(calls.set).toHaveLength(0);
   });
 
