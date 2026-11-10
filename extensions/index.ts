@@ -42,6 +42,7 @@ import { execFile } from "node:child_process";
 import { loadConfig, saveConfig, CONFIG_FILE, defaultConfigTemplate } from "./config.js";
 import type { Config } from "./config.js";
 import {
+  createMessageGate,
   makeChannelName,
   splitMessage,
   toolLabel,
@@ -49,7 +50,27 @@ import {
   sleep,
   withTimeout,
 } from "./helpers.js";
-import { buildStatusView, type SessionState, type StatusState } from "./status.js";
+import {
+  buildStatusView,
+  type SessionState,
+  type StatusState,
+} from "./status.js";
+import { type AgentFleet, type AgentRow } from "./agents.js";
+import {
+  buildInboundMessage,
+  describeSkipped,
+  loadInboundImage,
+  selectInboundImages,
+  INBOUND_FETCH_TIMEOUT_MS,
+  type InboundAttachment,
+  type InboundImageContent,
+  type InboundImageLoader,
+  type InboundSkipped,
+} from "./inbound-media.js";
+import {
+  createOptchatEventsClient,
+  type OptchatEventsClient,
+} from "./optchat-events.js";
 import {
   MODEL_SCOPE_NOTE_UNAVAILABLE,
   type ModelLike,
@@ -57,16 +78,22 @@ import {
 } from "./model-control.js";
 import {
   handlePiAbortInteraction,
+  handlePiAgentsInteraction,
   handlePiModelAutocomplete,
   handlePiModelInteraction,
   handlePiStatusInteraction,
+  handlePiStopInteraction,
   registerPiCommands,
   PI_ABORT_COMMAND,
   PI_ABORT_COMMAND_NAME,
+  PI_AGENTS_COMMAND,
+  PI_AGENTS_COMMAND_NAME,
   PI_MODEL_COMMAND,
   PI_MODEL_COMMAND_NAME,
   PI_STATUS_COMMAND,
   PI_STATUS_COMMAND_NAME,
+  PI_STOP_COMMAND,
+  PI_STOP_COMMAND_NAME,
   type PiAbortOutcome,
   type PiModelSwitchOutcome,
 } from "./slash.js";
@@ -82,7 +109,13 @@ const RECONNECT_MAX_ATTEMPTS = 10;
  * They are registered together (idempotently, upsert by name) — the
  * guild's other commands are never touched.
  */
-const PI_SLASH_COMMANDS = [PI_STATUS_COMMAND, PI_ABORT_COMMAND, PI_MODEL_COMMAND] as const;
+const PI_SLASH_COMMANDS = [
+  PI_STATUS_COMMAND,
+  PI_ABORT_COMMAND,
+  PI_MODEL_COMMAND,
+  PI_AGENTS_COMMAND,
+  PI_STOP_COMMAND,
+] as const;
 
 /** The command names, as rendered in the registration warnings. */
 const PI_SLASH_COMMAND_NAMES = PI_SLASH_COMMANDS.map((command) => `/${command.name}`).join(", ");
@@ -836,6 +869,10 @@ export interface PiInteractionHandlers {
   abort?: (interaction: any) => unknown;
   /** Handles a `/pi-model` interaction. */
   model?: (interaction: any) => unknown;
+  /** Handles a `/pi-agents` interaction. */
+  agents?: (interaction: any) => unknown;
+  /** Handles a `/pi-stop` interaction. */
+  stop?: (interaction: any) => unknown;
   /** Handles a `/pi-model` autocomplete interaction. */
   modelAutocomplete?: (interaction: any) => unknown;
 }
@@ -871,6 +908,12 @@ export async function routePiInteraction(
       return;
     case PI_MODEL_COMMAND_NAME:
       await handlers.model?.(interaction);
+      return;
+    case PI_AGENTS_COMMAND_NAME:
+      await handlers.agents?.(interaction);
+      return;
+    case PI_STOP_COMMAND_NAME:
+      await handlers.stop?.(interaction);
       return;
     default:
       // An unknown command is never answered.
@@ -908,6 +951,7 @@ export function buildSetupConfig(
     reactions: true,
     toolResponses: inputs.toolResponses === true,
     keepOnline: existing?.keepOnline !== false,
+    inboundImages: existing?.inboundImages !== false,
   };
 }
 
@@ -926,7 +970,41 @@ export default function (pi: ExtensionAPI) {
   let activeConfig: Config | null = null;
   const runtime: RuntimeState = { activeChannelId: null, sessionChannelName: null };
 
+  // ── OptChat event client (read-only) ──────────────────────────────────────
+
+  /**
+   * Read-only view of an OptChat owner running in this same Pi process.
+   *
+   * OptChat publishes a small versioned event contract on Pi's shared
+   * in-process bus (`pi.events`). This client binds it and exposes the
+   * owner's main-activity phase and background-agent fleet.
+   *
+   * It is **inert** unless OptChat is installed *and* has a profile open in
+   * this process: a plain Pi session, or one that merely *joined* a profile
+   * owned by another Pi, never publishes the contract. Nothing here is
+   * required for the extension to work.
+   *
+   * The client only listens — it never emits a request, so it cannot mutate
+   * anything. It is created eagerly so the listeners are attached before
+   * OptChat's first capability broadcast.
+   */
+  const optchatEvents: OptchatEventsClient = createOptchatEventsClient({
+    bus: pi.events,
+  });
+  optchatEvents.start();
+
   let agentBusy = false;
+  /**
+   * Guards the window between "a Discord message arrived" and "it was handed
+   * to Pi".
+   *
+   * `agentBusy` only turns true once the turn has *started*, which happens
+   * after the message is handed over — so during the attachment fetch a
+   * second message could arrive, overwrite this one's reply target and
+   * inject out of order. The gate is claimed synchronously, before the first
+   * await.
+   */
+  const messageGate = createMessageGate();
   let pendingReplyChannelId: string | null = null;
   let pendingReplyUserId: string | null = null;
   let collectedAssistantText: string[] = [];
@@ -1209,6 +1287,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx: ExtensionContext) => {
     capturedCtx = ctx;
+    // Ask a possibly-already-open OptChat owner for a fresh snapshot: the
+    // bus does not replay, so a ping is the only way to catch up.
+    optchatEvents.refresh();
     try {
       if (!sessionCwd) sessionCwd = ctx.cwd ?? null;
     } catch {
@@ -1531,20 +1612,46 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      if (agentBusy) {
+      // Claim the message **synchronously**, before the first await. The
+      // attachment fetch below can take seconds, and `agentBusy` only becomes
+      // true once the turn has started — so without this guard a second
+      // message would slip in, overwrite this one's reply target and inject
+      // out of order.
+      //
+      // `tryClaim()` is the atomic check: it returns false when a message is
+      // already in flight.
+      if (agentBusy || !messageGate.tryClaim()) {
         await message.reply("⏳ Still processing the previous message — please wait.").catch(() => {});
         return;
       }
 
-      if (activeConfig.reactions !== false) {
-        await message.react("⏳").catch(() => {});
-      }
+      try {
+        if (activeConfig.reactions !== false) {
+          await message.react("⏳").catch(() => {});
+        }
 
-      pendingReplyChannelId = message.channelId;
-      pendingReplyUserId = message.author.id;
-      collectedAssistantText = [];
-      lastPromptAt = new Date();
-      pi.sendUserMessage(message.content);
+        pendingReplyChannelId = message.channelId;
+        pendingReplyUserId = message.author.id;
+        collectedAssistantText = [];
+        lastPromptAt = new Date();
+
+        // Image attachments are handed to the model directly. When there are
+        // none the message goes in exactly as it did before — a plain string,
+        // unchanged.
+        const inbound =
+          activeConfig.inboundImages === false
+            ? { images: [] as InboundImageContent[], skipped: [] as InboundSkipped[] }
+            : await readInboundImages(message);
+
+        const skippedNotice = describeSkipped(inbound.skipped);
+        if (skippedNotice) {
+          await message.reply(skippedNotice).catch(() => {});
+        }
+
+        pi.sendUserMessage(buildInboundMessage(message.content, inbound.images));
+      } finally {
+        messageGate.release();
+      }
     };
   }
 
@@ -1648,6 +1755,12 @@ export default function (pi: ExtensionAPI) {
       const usage = readContextUsageSafe(capturedCtx);
       const session = readSessionIdentitySafe(capturedCtx);
 
+      // The OptChat view is read-only and entirely optional: a session
+      // without an OptChat owner simply reports nothing here.
+      const optchat = optchatEvents.getState();
+      const optchatStatus = optchat.mainStatus;
+      const optchatFleet = optchat.agentSnapshot;
+
       return {
         state,
         modelId: activeModel?.id ?? null,
@@ -1671,11 +1784,154 @@ export default function (pi: ExtensionAPI) {
         runStartedAt,
         lastToolName,
         errorMessage: lastError,
+        optchatProfile: optchatFleet?.profile ?? null,
+        optchatPhase: optchatStatus?.phase ?? null,
+        optchatTool: optchatStatus?.currentTool ?? null,
+        optchatToolCount: optchatStatus?.toolCount ?? null,
+        optchatPending: optchatStatus?.pending ?? null,
+        optchatAgentsActive: optchatFleet?.counts.active ?? null,
+        optchatAgentsTotal: optchatFleet?.counts.total ?? null,
       };
     } catch (err) {
       console.error("[pi-discord-remote] Failed to build the status snapshot:", err);
       return { state, errorMessage: lastError };
     }
+  }
+
+  // ── Inbound Discord attachments → Pi image content ────────────────────────
+
+  /**
+   * The network + resize operations the inbound-media module needs.
+   *
+   * Both are injected so the media logic stays unit-testable without Discord
+   * and without the network.
+   */
+  const inboundImageLoader: InboundImageLoader = {
+    /**
+     * Fetch an attachment's bytes, never reading more than `maxBytes`.
+     *
+     * The size is checked while the body streams, not after it is buffered,
+     * so an oversized attachment is abandoned instead of downloaded.
+     */
+    async fetchBytes(url: string, maxBytes: number): Promise<Uint8Array | null> {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), INBOUND_FETCH_TIMEOUT_MS);
+      try {
+        const response = await fetch(url, { signal: controller.signal });
+        if (!response.ok) return null;
+
+        const declared = Number(response.headers.get("content-length") ?? "");
+        if (Number.isFinite(declared) && declared > maxBytes) return null;
+
+        const reader = response.body?.getReader();
+        if (!reader) {
+          const buffer = await response.arrayBuffer();
+          if (buffer.byteLength > maxBytes) return null;
+          return new Uint8Array(buffer);
+        }
+
+        const chunks: Uint8Array[] = [];
+        let total = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!value) continue;
+          total += value.byteLength;
+          if (total > maxBytes) {
+            await reader.cancel().catch(() => {});
+            return null;
+          }
+          chunks.push(value);
+        }
+
+        const merged = new Uint8Array(total);
+        let offset = 0;
+        for (const chunk of chunks) {
+          merged.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        return merged;
+      } catch {
+        return null;
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+
+    /**
+     * Downscale an image to a model-friendly size.
+     *
+     * The resizer is loaded **dynamically**: it only exists in newer Pi
+     * versions, and a static import would stop the whole extension from
+     * loading on an older one. When it is missing, the bytes are forwarded
+     * unchanged — but only when they are already small enough to be safe.
+     */
+    async resize(bytes, mimeType, options) {
+      const pi = (await import("@earendil-works/pi-coding-agent")) as {
+        resizeImage?: (
+          input: Uint8Array,
+          mime: string,
+          opts: { maxWidth: number; maxHeight: number; maxBytes: number },
+        ) => Promise<{ data: string; mimeType: string } | null>;
+      };
+
+      if (typeof pi.resizeImage !== "function") {
+        // An older Pi without the resizer: forward the bytes as they are, but
+        // only when they already fit the budget.
+        if (bytes.length > options.maxBytes) return null;
+        return { data: Buffer.from(bytes).toString("base64"), mimeType };
+      }
+
+      const resized = await pi.resizeImage(bytes, mimeType, options);
+      return resized ? { data: resized.data, mimeType: resized.mimeType } : null;
+    },
+  };
+
+  /**
+   * Read the image attachments of a Discord message into Pi image content.
+   *
+   * The attachments are fetched **in parallel**, so the wait is one timeout
+   * rather than one per image. Every failure is a skip, never an exception:
+   * a broken attachment must not stop the message from reaching the agent.
+   */
+  async function readInboundImages(message: Message): Promise<{
+    images: InboundImageContent[];
+    skipped: InboundSkipped[];
+  }> {
+    const attachments: InboundAttachment[] = [...message.attachments.values()].map(
+      (attachment) => ({
+        id: attachment.id,
+        name: attachment.name,
+        url: attachment.url,
+        size: attachment.size,
+        contentType: attachment.contentType,
+      }),
+    );
+
+    const selection = selectInboundImages(attachments);
+    const skipped: InboundSkipped[] = [...selection.skipped];
+
+    const results = await Promise.all(
+      selection.accepted.map(async (attachment) => ({
+        attachment,
+        result: await loadInboundImage(attachment, inboundImageLoader),
+      })),
+    );
+
+    const images: InboundImageContent[] = [];
+    for (const { attachment, result } of results) {
+      if (result.ok) {
+        images.push(result.image);
+        continue;
+      }
+      skipped.push({
+        name: attachment.name?.trim() || attachment.id,
+        reason: result.reason,
+        size: attachment.size,
+      });
+    }
+
+    return { images, skipped };
   }
 
   // ── Session control (/pi-abort, /pi-model) ─────────────────────────────────
@@ -1706,6 +1962,72 @@ export default function (pi: ExtensionAPI) {
    */
   function listSessionModels(): ModelLike[] {
     return readModelScopeSafe(capturedCtx).models;
+  }
+
+  /**
+   * The background-agent fleet of the bound OptChat owner.
+   *
+   * `null` means no OptChat owner is bound to this session — a different
+   * situation from an owner that simply has no agents, and the `/pi-agents`
+   * reply says so. Read-only: nothing here starts or stops an agent.
+   */
+  function readAgentFleet(): AgentFleet | null {
+    const state = optchatEvents.getState();
+    if (!state.owner) return null;
+    const snapshot = state.agentSnapshot;
+    // The owner is bound but its fleet snapshot has not arrived yet (a short
+    // window right after the owner binds). Say so rather than claiming the
+    // profile has no agents.
+    if (!snapshot) {
+      return {
+        profile: null,
+        counts: { active: 0, paused: 0, handingOff: 0, total: 0, omitted: 0 },
+        agents: [],
+        pending: true,
+      };
+    }
+    return {
+      profile: snapshot.profile,
+      counts: snapshot.counts,
+      agents: snapshot.agents.map((agent) => ({
+        runId: agent.runId,
+        state: agent.state,
+        handingOff: agent.handingOff,
+        model: agent.model,
+        elapsed: agent.elapsed,
+        currentTool: agent.currentTool,
+        depth: agent.depth,
+        startedAt: agent.startedAt,
+        live: true,
+      })),
+    };
+  }
+
+  /**
+   * Every run this client has seen, with the generation token it was seen
+   * with.
+   *
+   * `null` means no OptChat owner is bound — the caller must not treat that
+   * as "there are no runs".
+   *
+   * The list includes runs that have already left the fleet snapshot: their
+   * token stays valid for a later `agent:resume`, and it is the only source
+   * of a token for a run that is no longer listed.
+   */
+  function readKnownRuns(): AgentRow[] | null {
+    const state = optchatEvents.getState();
+    if (!state.owner) return null;
+    return optchatEvents.getKnownRuns().map((run) => ({
+      runId: run.runId,
+      state: run.state,
+      handingOff: run.handingOff,
+      model: run.model,
+      elapsed: run.elapsed,
+      currentTool: run.currentTool,
+      depth: run.depth,
+      startedAt: run.startedAt,
+      live: run.live,
+    }));
   }
 
   /**
@@ -1793,6 +2115,17 @@ export default function (pi: ExtensionAPI) {
               hasSession: hasActiveSession,
               switchModel: switchSessionModel,
             }),
+          agents: (agentsInteraction) =>
+            handlePiAgentsInteraction(agentsInteraction, {
+              allowedUserIds: activeConfig?.allowedUserIds,
+              readFleet: readAgentFleet,
+            }),
+          stop: (stopInteraction) =>
+            handlePiStopInteraction(stopInteraction, {
+              allowedUserIds: activeConfig?.allowedUserIds,
+              listRuns: readKnownRuns,
+              stopRun: (target) => optchatEvents.stopAgent(target),
+            }),
         });
       } catch (err) {
         // Only the error *name* is logged — never the message, the stack,
@@ -1858,6 +2191,9 @@ export default function (pi: ExtensionAPI) {
   // ── Session cleanup ───────────────────────────────────────────────────────
 
   pi.on("session_shutdown", async (event: any) => {
+    // Stop listening on Pi's shared bus. On a reload the extension is
+    // re-created with a fresh client; on a real shutdown this is the end.
+    optchatEvents.dispose();
     // Reject any pending question so tool execution doesn't hang
     if (questionRejecter) {
       questionRejecter(new Error("Session shut down"));

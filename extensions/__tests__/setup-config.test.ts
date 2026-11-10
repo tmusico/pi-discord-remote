@@ -38,7 +38,31 @@ describe("buildSetupConfig", () => {
       reactions: true,
       toolResponses: true,
       keepOnline: true,
+      inboundImages: true,
     });
+  });
+
+  it("defaults inboundImages to true when there is no existing config", () => {
+    expect(buildSetupConfig(null, inputs).inboundImages).toBe(true);
+  });
+
+  it("preserves an existing inboundImages: false", () => {
+    const existing = {
+      token: "old-token",
+      guildId: "old-guild",
+      keepOnline: true,
+      inboundImages: false,
+    };
+    expect(buildSetupConfig(existing, inputs).inboundImages).toBe(false);
+  });
+
+  it("keeps an existing inboundImages: true", () => {
+    const existing = {
+      token: "old-token",
+      guildId: "old-guild",
+      inboundImages: true,
+    };
+    expect(buildSetupConfig(existing, inputs).inboundImages).toBe(true);
   });
 
   it("omits empty optional answers", () => {

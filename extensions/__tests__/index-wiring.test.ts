@@ -847,6 +847,8 @@ describe("routePiInteraction", () => {
         status: () => calls.push("status"),
         abort: () => calls.push("abort"),
         model: () => calls.push("model"),
+        agents: () => calls.push("agents"),
+        stop: () => calls.push("stop"),
         modelAutocomplete: () => calls.push("autocomplete"),
       },
     };
@@ -886,7 +888,7 @@ describe("routePiInteraction", () => {
   it("dispatches every known chat-input command", async () => {
     const { calls, handlers: fake } = handlers();
 
-    for (const commandName of ["pi-status", "pi-abort", "pi-model"]) {
+    for (const commandName of ["pi-status", "pi-abort", "pi-model", "pi-agents", "pi-stop"]) {
       await routePiInteraction(
         {
           isAutocomplete: () => false,
@@ -897,7 +899,7 @@ describe("routePiInteraction", () => {
       );
     }
 
-    expect(calls).toEqual(["status", "abort", "model"]);
+    expect(calls).toEqual(["status", "abort", "model", "agents", "stop"]);
   });
 
   it("ignores an unknown command", async () => {

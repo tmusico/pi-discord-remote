@@ -396,3 +396,65 @@ describe("formatStatusText", () => {
     expect(text).not.toMatch(/null/);
   });
 });
+
+// ─── OptChat owner view ──────────────────────────────────────────────────────
+
+describe("buildStatusView: OptChat field", () => {
+  it("drops the field entirely when no OptChat owner is present", () => {
+    const view = buildStatusView(FULL_STATE);
+    expect(view.fields.map((field) => field.name)).not.toContain("OptChat");
+  });
+
+  it("renders profile, phase, tool and agent counts", () => {
+    const view = buildStatusView({
+      ...FULL_STATE,
+      optchatProfile: "work",
+      optchatPhase: "working",
+      optchatTool: "bash",
+      optchatToolCount: 3,
+      optchatAgentsActive: 2,
+      optchatAgentsTotal: 4,
+    });
+    const optchat = view.fields.find((field) => field.name === "OptChat");
+    expect(optchat?.value).toBe("work · working · bash (+2) · 2/4 agents");
+  });
+
+  it("renders a single agent without a fraction", () => {
+    const view = buildStatusView({
+      ...FULL_STATE,
+      optchatAgentsActive: 1,
+      optchatAgentsTotal: 1,
+    });
+    const optchat = view.fields.find((field) => field.name === "OptChat");
+    expect(optchat?.value).toBe("1 agent");
+  });
+
+  it("mentions the pending flag only when messages are queued", () => {
+    const pending = buildStatusView({ ...FULL_STATE, optchatPending: true });
+    expect(pending.fields.find((f) => f.name === "OptChat")?.value).toBe("pending");
+
+    const notPending = buildStatusView({ ...FULL_STATE, optchatPending: false });
+    expect(notPending.fields.find((f) => f.name === "OptChat")).toBeUndefined();
+  });
+
+  it("shows the tool without a count when only one tool is observed", () => {
+    const view = buildStatusView({ ...FULL_STATE, optchatTool: "read", optchatToolCount: 1 });
+    expect(view.fields.find((f) => f.name === "OptChat")?.value).toBe("read");
+  });
+
+  it("never renders undefined/NaN/null", () => {
+    const view = buildStatusView({
+      ...FULL_STATE,
+      optchatProfile: null,
+      optchatPhase: null,
+      optchatTool: null,
+      optchatToolCount: null,
+      optchatPending: null,
+      optchatAgentsActive: null,
+      optchatAgentsTotal: null,
+    });
+    for (const value of renderedValues(view)) {
+      expect(value).not.toMatch(/\bundefined\b|\bNaN\b|\bnull\b/);
+    }
+  });
+});

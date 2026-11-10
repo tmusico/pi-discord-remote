@@ -22,9 +22,9 @@ pi install npm:pi-discord-remote
    - Add Reactions
    - **Manage Channels** ← required for auto-create/delete
 4. Invite the bot with the **`applications.commands`** scope as well — the `/pi-status`,
-   `/pi-abort` and `/pi-model` slash commands only appear when the bot was invited with that
-   scope. Re-invite it once with this URL (`<APP_ID>` is the **Application ID** from the
-   Developer Portal, not the bot user id):
+   `/pi-abort`, `/pi-model`, `/pi-agents` and `/pi-stop` slash commands only appear when the bot
+   was invited with that scope. Re-invite it once with this URL (`<APP_ID>` is the **Application
+   ID** from the Developer Portal, not the bot user id):
 
    ```
    https://discord.com/oauth2/authorize?client_id=<APP_ID>&scope=bot%20applications.commands&permissions=274145945856
@@ -56,6 +56,10 @@ Type `/pi-status` in the guild (any channel) — the bot answers with an embed. 
 injects anything into the Pi session and never prints the bot token, the system prompt or
 file contents. A failed or aborted turn is reported as a generic label (`aborted`,
 `turn failed`) — the provider's raw error text stays in the local log.
+
+When the session is owned by an [OptChat](https://github.com/tony-musico/pi-optchat) profile,
+the reply gains one extra **OptChat** field — see
+[OptChat integration](#optchat-integration-read-only).
 
 ### `/pi-abort` (Discord slash command)
 
@@ -118,6 +122,68 @@ The reply always states “(this session)” so the scope of the change is never
 Both new commands honour the same `allowedUserIds` allow-list as `/pi-status`: a user outside
 the list gets a short refusal and nothing else.
 
+### `/pi-agents` (Discord slash command)
+
+Lists the **background agents** of the [OptChat](https://github.com/tony-musico/pi-optchat)
+profile that owns this session — the subagents OptChat is running, their state, model, age, the
+tool running right now and their depth.
+
+The reply is **ephemeral** — only the person who ran the command sees it. The command is
+**read-only**: it lists what OptChat published and never starts, stops or steers anything.
+
+```
+🔌 Pi Background Agents
+2 active · 1 paused · 3 total
+profile: work
+  running      `abcdef01` · running · openai-codex/gpt-6.1-sol · 3m 20s · 🔧 bash · depth 1
+  paused       `fedcba98` · paused · 1m · depth 2
+```
+
+| Reply | Meaning |
+|-------|---------|
+| The agent list | The OptChat profile's background agents |
+| ℹ️ No OptChat owner is bound to this session. | OptChat is not running in this same Pi process (see [OptChat integration](#optchat-integration-read-only)) |
+| ℹ️ No background agents in the "work" profile. | The owner is bound, but the profile has no subagents |
+| ℹ️ The agent list is not available yet — try again in a moment. | The owner just bound; its snapshot has not arrived yet |
+| ⚠️ The agent list is unavailable right now. | The snapshot could not be read (provider details stay in the local log) |
+
+At most 20 runs are listed; a longer fleet is truncated and the reply says so. The fleet snapshot
+itself never carries task text, titles, paths, transcripts, tool arguments or tool output.
+
+### `/pi-stop` (Discord slash command)
+
+Stops **one background agent** of the OptChat profile that owns this session.
+
+```
+/pi-stop abcdef01
+```
+
+The `run` option takes a run id — the short prefix `/pi-agents` shows is enough. The reply is
+**ephemeral**.
+
+The run is named by its **generation token**: the extension sends back the `startedAt` it saw for
+that run, and OptChat refuses a mismatch with `STALE_RUN`. So a run that was resumed in the
+meantime is never stopped by mistake.
+
+This needs OptChat's **agent-control gate**: turn on *Events control* in `/optchat settings`, or
+start Pi with `--optchat-events-control`. Without it the reply says so.
+
+| Reply | Meaning |
+|-------|---------|
+| 🛑 Stop requested for the run. | OptChat accepted the stop |
+| ⚠️ That run changed generation — run /pi-agents again and retry with the current id. | The run was resumed since the list was read — nothing was stopped |
+| That run is no longer running. | The run had already finished |
+| ❌ No background agent matches that run id. | The run id matched nothing |
+| ❌ That run id matches several agents — use a longer prefix. | The prefix was ambiguous |
+| ⚠️ OptChat's agent-control gate is off. | The control gate is off — nothing was sent |
+| ℹ️ No OptChat owner is bound to this session. | OptChat is not running in this same Pi process |
+| ⚠️ That run cannot be controlled from Discord … | The run is nested or connected — only top-level runs are controllable |
+| ⚠️ The outcome is unknown — the stop may or may not have happened. | No result arrived in time — check /pi-agents before retrying |
+| ⚠️ The stop could not be completed. | The request failed for another reason |
+
+A run the extension never saw while it was running has no published generation token, so it
+cannot be targeted — the reply says so rather than guessing.
+
 ### Hub mode (bot online without a session)
 
 `/pi-discord-remote stop` ends the *session* but keeps the Discord connection alive, so
@@ -125,7 +191,8 @@ the list gets a short refusal and nothing else.
 working). In hub mode the extension ignores every channel message — there is no session
 channel, so nothing is injected into Pi. `/pi-abort` and `/pi-model` answer **“No Pi session is
 connected.”** in hub mode as well — there is no remote session to stop or re-model, and the
-model list is only available for a bound session.
+model list is only available for a bound session. `/pi-agents` and `/pi-stop` still answer in hub
+mode: the agent list comes from the OptChat owner, not from the Discord session.
 
 - `/pi-discord-remote disconnect` — log out completely (destroys the Discord client).
 - `/pi-discord-remote start` while in hub mode — reconnects and creates a fresh session channel.
@@ -165,6 +232,7 @@ For CI or headless setups, you can skip `setup` entirely and set these env vars:
 | `reactions` | boolean | `true` | React with ⏳ while processing |
 | `toolResponses` | boolean | `false` | Also post tool outputs/results alongside tool-call labels (truncated to ≤400 chars) |
 | `keepOnline` | boolean | `true` | Keep the Discord connection alive after `/pi-discord-remote stop` (hub mode, so `/pi-status` still works). `false` = old behaviour (stop also disconnects) |
+| `inboundImages` | boolean | `true` | Read image attachments on Discord messages and hand them to the model (images only; resized to ≤2048 px / ≤2 MB, ≤4 per message) |
 
 Edit config with `/pi-discord-remote open-config`.
 
@@ -177,6 +245,74 @@ The extension loads silently on Pi startup — no channel is created until you e
 - **Tool calls** — each tool invocation is labeled (🔧 bash, 📄 read, ✏️ edit, etc.) with a detail line; if `toolResponses` is on, results follow as ↩️/❌ code blocks
 - **`/pi-discord-remote stop`** — the session channel is deleted and the session state is cleared; the bot stays online so `/pi-status` keeps working (set `keepOnline: false` to disconnect as well)
 - **`/pi-discord-remote disconnect`** (or Pi exit) — the channel is deleted and the bot disconnects completely
+
+### OptChat integration (read-only)
+
+If [OptChat](https://github.com/tony-musico/pi-optchat) is installed in the **same Pi process**
+and has a profile open, `pi-discord-remote` binds OptChat's in-process event contract
+(`pi.events`) and adds one **OptChat** field to `/pi-status`:
+
+```
+🔌 OptChat  work · working · bash (+2) · 2/4 agents
+```
+
+It shows the OptChat profile's name, the main agent's phase
+(`idle` / `working` / `responding` / `awaiting-input` / `closing`), the tool that is running right
+now, and how many background agents the profile has. The full per-run list is available through
+the [`/pi-agents`](#pi-agents-discord-slash-command) command, and one of them can be stopped with
+[`/pi-stop`](#pi-stop-discord-slash-command).
+
+The integration is **read-only by default**: it listens and displays. `/pi-stop` is the one
+mutation, and it needs OptChat's agent-control gate.
+
+**When it applies.** `pi.events` is local to one Pi process, so the contract is only published when
+OptChat is installed *and* owns the profile **in this very process**. It is **not** available for:
+
+- a plain Pi session with no OptChat installed,
+- a one-shot run (`pi -p`) or JSON mode,
+- a session that *joined* a profile owned by another Pi (`--optchat-connect join`) — the owner lives
+  in the other process.
+
+**Degradation.** The extension is unchanged when the contract is absent:
+
+| Situation | Behaviour |
+|-----------|-----------|
+| OptChat not installed | No OptChat field. Everything else works as before. |
+| OptChat installed, no profile open | No OptChat field. |
+| OptChat installed, profile open | The OptChat field appears. |
+| OptChat's profile is closed or switched | The field disappears again — a stale value is never shown. |
+
+OptChat's consent gates (*Events content* / *Events control* in `/optchat settings`, or the
+`--optchat-events-content` / `--optchat-events-control` flags) are **not** needed for this: the
+fields above are metadata only. Changing a gate makes OptChat rebuild its integration, which
+replaces the owner with a new one — `pi-discord-remote` rebinds to the new owner and drops the
+previous owner's data.
+
+Live streaming of assistant output and history reads are deliberately **not** implemented here. The
+background-agent list (`/pi-agents`) and the agent-control command (`/pi-stop`) are the two
+Discord-facing additions.
+
+### Reading images from Discord
+
+The other direction works on its own: **an image you attach to a Discord message is handed to
+the model**, alongside your text.
+
+```
+[you]      what is broken here?   📎 screenshot.png
+[agent]    The stack trace shows …                        ← it saw the screenshot
+```
+
+- The image is resized to **≤2048 px** and **≤2 MB** before it goes into the prompt.
+- Your text is passed through **verbatim**. A message with no text at all gets a structural
+  `[1 image attachment]` marker, so the turn still fires.
+- At most **4 images** are read per message; an attachment larger than **10 MB** is skipped
+  without being downloaded.
+- Only **images** are supported — Pi's user message takes image content, not other file types.
+- When something is skipped, the bot says so in the channel, e.g.
+  `⚠️ Skipped attachment: screenshot.png (too large (12.0 MB, limit 10.0 MB))` — otherwise the
+  agent would just report that it cannot see the image.
+
+Set `"inboundImages": false` in the config to turn it off.
 
 ### Optional image skill tool
 

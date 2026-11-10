@@ -31,6 +31,15 @@ export interface Config {
    * Default: true.
    */
   keepOnline?: boolean;
+  /**
+   * Read image attachments on Discord messages and hand them to the model
+   * (default: true).
+   *
+   * Only images are supported — Pi's user message accepts image content, not
+   * other file types. An attachment that is too large is skipped and the
+   * reason is posted in the channel.
+   */
+  inboundImages?: boolean;
 }
 
 /**
@@ -57,6 +66,7 @@ export async function loadConfig(file: string = CONFIG_FILE): Promise<Config | n
         reactions: true,
         toolResponses: false,
         keepOnline: true,
+        inboundImages: true,
       };
     }
     return null;
@@ -89,6 +99,8 @@ export function defaultConfigTemplate(): string {
         // Keep the bot connected after /pi-discord-remote stop so /pi-status
         // can still answer. Set to false for the old "stop = disconnect" behavior.
         keepOnline: true,
+        // Read image attachments on Discord messages and hand them to the model
+        inboundImages: true,
       },
       null,
       2,

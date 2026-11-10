@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  createMessageGate,
   makeChannelName,
   splitMessage,
   toolLabel,
@@ -227,5 +228,60 @@ describe("withTimeout", () => {
   it("cleans up the timer on success", async () => {
     // Should not throw or leak — just verifies no unhandled timer
     await withTimeout(Promise.resolve("ok"), 10_000, "timer_cleanup");
+  });
+});
+
+// ─── createMessageGate ───────────────────────────────────────────────────────
+
+describe("createMessageGate", () => {
+  it("claims an empty slot", () => {
+    const gate = createMessageGate();
+    expect(gate.isInFlight()).toBe(false);
+    expect(gate.tryClaim()).toBe(true);
+    expect(gate.isInFlight()).toBe(true);
+  });
+
+  it("refuses a second claim while one is in flight", () => {
+    const gate = createMessageGate();
+    expect(gate.tryClaim()).toBe(true);
+    expect(gate.tryClaim()).toBe(false);
+    expect(gate.tryClaim()).toBe(false);
+  });
+
+  it("allows a new claim after the slot is released", () => {
+    const gate = createMessageGate();
+    gate.tryClaim();
+    gate.release();
+    expect(gate.isInFlight()).toBe(false);
+    expect(gate.tryClaim()).toBe(true);
+  });
+
+  it("releasing an unclaimed slot is harmless", () => {
+    const gate = createMessageGate();
+    expect(() => gate.release()).not.toThrow();
+    expect(gate.isInFlight()).toBe(false);
+    expect(gate.tryClaim()).toBe(true);
+  });
+
+  it("keeps a slow message from letting a second one through", async () => {
+    const gate = createMessageGate();
+    const order: string[] = [];
+
+    const slow = (async () => {
+      if (!gate.tryClaim()) return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      order.push("first");
+      gate.release();
+    })();
+
+    // A second message arrives while the first is still being prepared.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    if (gate.tryClaim()) {
+      order.push("second");
+      gate.release();
+    }
+
+    await slow;
+    expect(order).toEqual(["first"]);
   });
 });

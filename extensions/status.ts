@@ -71,6 +71,26 @@ export interface StatusState {
    * details, credentials, prompt excerpts or tool output.
    */
   errorMessage?: string | null;
+  /**
+   * Name of the OptChat profile that owns this session, when an OptChat
+   * owner is present in the same Pi process.
+   *
+   * Null (and every other `optchat*` field) means "no OptChat owner" — the
+   * normal case for a plain Pi session.
+   */
+  optchatProfile?: string | null;
+  /** The main agent's phase: idle / working / responding / awaiting-input / closing. */
+  optchatPhase?: string | null;
+  /** The tool the main agent is running right now — a sanitized name only. */
+  optchatTool?: string | null;
+  /** How many tools the main agent has in flight, or null when unknown. */
+  optchatToolCount?: number | null;
+  /** Whether Pi reports queued (pending) user messages. */
+  optchatPending?: boolean | null;
+  /** How many background agents are active. */
+  optchatAgentsActive?: number | null;
+  /** How many background agents the profile knows about in total. */
+  optchatAgentsTotal?: number | null;
 }
 
 /** One rendered embed field. */
@@ -328,6 +348,43 @@ function buildDiscordValue(state: StatusState): string | null {
   return sanitize(parts.join(" · "));
 }
 
+/**
+ * Render the OptChat owner's view of this session.
+ *
+ * Entirely optional: when no OptChat owner is present every field is unknown
+ * and the whole field is dropped, so the status reply looks exactly as it did
+ * before this integration existed.
+ */
+function buildOptchatValue(state: StatusState): string | null {
+  const parts: string[] = [];
+
+  const profile = clean(state.optchatProfile);
+  if (profile) parts.push(profile);
+
+  const phase = clean(state.optchatPhase);
+  if (phase) parts.push(phase);
+
+  const tool = clean(state.optchatTool);
+  const toolCount = num(state.optchatToolCount);
+  if (tool) {
+    // The count is the number of observed tools; the tool itself is one of
+    // them, so only the *extra* ones are worth mentioning.
+    parts.push(toolCount !== null && toolCount > 1 ? `${tool} (+${toolCount - 1})` : tool);
+  }
+
+  const active = num(state.optchatAgentsActive);
+  const total = num(state.optchatAgentsTotal);
+  if (total !== null) {
+    if (active !== null && active !== total) parts.push(`${active}/${total} agents`);
+    else parts.push(`${total} agent${total === 1 ? "" : "s"}`);
+  }
+
+  if (state.optchatPending === true) parts.push("pending");
+
+  if (parts.length === 0) return null;
+  return sanitize(parts.join(" · "));
+}
+
 // ─── View builder ────────────────────────────────────────────────────────────
 
 function normalizeState(raw: unknown): SessionState {
@@ -382,6 +439,7 @@ export function buildStatusView(state: StatusState): StatusView {
   push("Context", buildContextValue(snapshot));
   push("Session", buildSessionValue(snapshot));
   push("Activity", buildActivityValue(snapshot, now));
+  push("OptChat", buildOptchatValue(snapshot));
   push("Discord", buildDiscordValue(snapshot));
 
   return {

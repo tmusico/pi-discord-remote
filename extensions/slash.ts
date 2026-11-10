@@ -1,5 +1,6 @@
 /**
- * Discord slash commands: `/pi-status`, `/pi-abort` and `/pi-model`.
+ * Discord slash commands: `/pi-status`, `/pi-abort`, `/pi-model` and
+ * `/pi-agents`.
  *
  * Every piece is free of any dependency on `extensions/index.ts`:
  *   • the command definitions sent to Discord,
@@ -35,6 +36,13 @@ import {
   buildStatusView,
   type StatusState,
 } from "./status.js";
+import {
+  buildAgentFleetEmbed,
+  buildAgentFleetView,
+  resolveRunSelection,
+  type AgentFleet,
+  type AgentRow,
+} from "./agents.js";
 
 // ─── Command definition ──────────────────────────────────────────────────────
 
@@ -96,6 +104,47 @@ export const PI_MODEL_COMMAND_NAME = PI_MODEL_COMMAND.name;
 
 /** Name of the `model` option of `/pi-model`. */
 export const PI_MODEL_OPTION_NAME = "model";
+
+/**
+ * The `/pi-agents` command definition.
+ *
+ * Lists the background agents of the OptChat profile that owns this session.
+ * It is read-only: it never starts, stops or steers anything.
+ */
+export const PI_AGENTS_COMMAND = {
+  name: "pi-agents",
+  description: "List the background agents of the OptChat profile owning this session",
+  type: 1,
+} as const;
+
+/** Name of the command as registered in Discord. */
+export const PI_AGENTS_COMMAND_NAME = PI_AGENTS_COMMAND.name;
+
+/**
+ * The `/pi-stop` command definition.
+ *
+ * Stops one background agent of the OptChat profile that owns this session.
+ * The `run` option takes a run id (or the short prefix `/pi-agents` shows).
+ */
+export const PI_STOP_COMMAND = {
+  name: "pi-stop",
+  description: "Stop one background agent by run id (see /pi-agents)",
+  type: 1,
+  options: [
+    {
+      name: "run",
+      description: "run id, or the short prefix /pi-agents shows",
+      type: 3,
+      required: true,
+    },
+  ],
+} as const;
+
+/** Name of the command as registered in Discord. */
+export const PI_STOP_COMMAND_NAME = PI_STOP_COMMAND.name;
+
+/** Name of the `run` option of `/pi-stop`. */
+export const PI_STOP_OPTION_NAME = "run";
 
 // ─── Minimal structural Discord types ────────────────────────────────────────
 // Structural (instead of discord.js) types so the module can be unit-tested
@@ -968,6 +1017,308 @@ export async function handlePiModelInteraction(
       /* the deferred reply is gone — nothing else we can do */
     }
     return { ok: false, error: "model_unavailable" };
+  }
+}
+
+// ─── /pi-agents ──────────────────────────────────────────────────────────────
+
+/** Dependencies of {@link handlePiAgentsInteraction}. */
+export interface PiAgentsInteractionDeps {
+  /** Allow-list of Discord user ids. Empty/undefined = allow everyone. */
+  allowedUserIds?: string[];
+  /**
+   * Returns the background-agent fleet of the bound OptChat owner.
+   *
+   * `null` means no OptChat owner is bound — a different situation from an
+   * owner that simply has no agents, and the reply says so.
+   */
+  readFleet: () => AgentFleet | null | Promise<AgentFleet | null>;
+}
+
+/** Result of {@link handlePiAgentsInteraction} — safe to log. */
+export interface PiAgentsInteractionResult {
+  ok: boolean;
+  error?: string;
+}
+
+/** The fleet could not be read. */
+export const PI_AGENTS_UNAVAILABLE = "⚠️ The agent list is unavailable right now.";
+
+/**
+ * Handle a `/pi-agents` interaction.
+ *
+ * Read-only: it lists what the OptChat owner published and never starts,
+ * stops or steers anything. Every path is ephemeral — refusals, success and
+ * internal errors.
+ */
+export async function handlePiAgentsInteraction(
+  interaction: PiStatusInteraction,
+  deps: PiAgentsInteractionDeps,
+): Promise<PiAgentsInteractionResult> {
+  const allowed = deps.allowedUserIds;
+  if (Array.isArray(allowed) && allowed.length > 0 && !allowed.includes(interaction.user.id)) {
+    try {
+      await interaction.reply({ content: PI_STATUS_REFUSAL, ephemeral: true });
+    } catch (err) {
+      console.error(
+        "[pi-discord-remote] /pi-agents: refusal reply failed:",
+        describeErrorSafely(err),
+      );
+      return { ok: false, error: "refusal_failed" };
+    }
+    return { ok: false, error: "not_allowed" };
+  }
+
+  // Acknowledge first: Discord only allows 3 seconds for the first reply.
+  try {
+    await interaction.deferReply({ ephemeral: true });
+  } catch (err) {
+    console.error("[pi-discord-remote] /pi-agents: deferReply failed:", describeErrorSafely(err));
+    return { ok: false, error: "defer_failed" };
+  }
+
+  try {
+    const fleet = await deps.readFleet();
+    const view = buildAgentFleetView(fleet, fleet !== null && fleet !== undefined);
+    if (view.empty) {
+      await interaction.editReply({ content: view.empty });
+      return { ok: true };
+    }
+    await interaction.editReply({ embeds: [buildAgentFleetEmbed(view)] });
+    return { ok: true };
+  } catch (err) {
+    // The detail stays in the local log — the Discord reply must never
+    // expose a stack trace, the bot token, the system prompt or file
+    // contents.
+    console.error("[pi-discord-remote] /pi-agents: agent list failed:", describeErrorSafely(err));
+    try {
+      await interaction.editReply({ content: PI_AGENTS_UNAVAILABLE });
+    } catch {
+      /* the deferred reply is gone — nothing else we can do */
+    }
+    return { ok: false, error: "agents_unavailable" };
+  }
+}
+
+// ─── /pi-stop ────────────────────────────────────────────────────────────────
+
+/** The outcome of a stop attempt. */
+export type PiStopOutcome =
+  | "stopped"
+  | "not_running"
+  | "stale"
+  | "disabled"
+  | "no_owner"
+  | "unknown_run"
+  | "ambiguous"
+  | "no_token"
+  | "denied"
+  | "unknown";
+
+/** Dependencies of {@link handlePiStopInteraction}. */
+export interface PiStopInteractionDeps {
+  /** Allow-list of Discord user ids. Empty/undefined = allow everyone. */
+  allowedUserIds?: string[];
+  /**
+   * The runs this client knows about, with the generation token each was
+   * seen with.
+   *
+   * `null` means no OptChat owner is bound — a different situation from an
+   * owner that simply has no runs, and the reply says so.
+   */
+  listRuns: () => AgentRow[] | null;
+  /**
+   * Asks the owner to stop one run.
+   *
+   * The result carries the contract's **fixed** error codes only — never an
+   * exception message, a provider error or a path.
+   */
+  stopRun: (target: { runId: string; expectedStartedAt: number }) => Promise<{
+    ok: boolean;
+    code: string | null;
+  }>;
+}
+
+/** Result of {@link handlePiStopInteraction} — safe to log. */
+export interface PiStopInteractionResult {
+  ok: boolean;
+  error?: string;
+  /** The outcome, when the interaction got far enough to have one. */
+  outcome?: PiStopOutcome;
+}
+
+/** The run was stopped. */
+export const PI_STOP_STOPPED = "🛑 Stop requested for the run.";
+
+/** The run is not running any more. */
+export const PI_STOP_NOT_RUNNING = "That run is no longer running.";
+
+/** The run changed generation since the token was read. */
+export const PI_STOP_STALE =
+  "That run changed generation — run /pi-agents again and retry with the current id.";
+
+/** OptChat's agent-control gate is off. */
+export const PI_STOP_DISABLED =
+  "⚠️ OptChat's agent-control gate is off.\n" +
+  "Turn it on with /optchat settings → Events control (or --optchat-events-control), " +
+  "then retry.";
+
+/** No OptChat owner is bound. */
+export const PI_STOP_NO_OWNER =
+  "ℹ️ No OptChat owner is bound to this session — there is nothing to stop.";
+
+/** The run id matched nothing. */
+export const PI_STOP_UNKNOWN_RUN = "❌ No background agent matches that run id.";
+
+/** The run id matched several runs. */
+export const PI_STOP_AMBIGUOUS =
+  "❌ That run id matches several agents — use a longer prefix.";
+
+/** The run's generation token is not published. */
+export const PI_STOP_NO_TOKEN =
+  "⚠️ That run's generation token is not published, so it cannot be targeted safely.";
+
+/** The run cannot be targeted at all (nested or connected runs are not controllable). */
+export const PI_STOP_DENIED =
+  "⚠️ That run cannot be controlled from Discord (nested and connected runs are not " +
+  "controllable) — try a top-level run.";
+
+/** The outcome is genuinely unknown: the stop may or may not have happened. */
+export const PI_STOP_UNKNOWN_OUTCOME =
+  "⚠️ The outcome is unknown — the stop may or may not have happened.\n" +
+  "Check /pi-agents before retrying.";
+
+/** The stop could not be completed. */
+export const PI_STOP_UNAVAILABLE = "⚠️ The stop could not be completed.";
+
+/** Render a stop outcome. */
+function renderStopOutcome(outcome: PiStopOutcome): string {
+  switch (outcome) {
+    case "stopped":
+      return PI_STOP_STOPPED;
+    case "not_running":
+      return PI_STOP_NOT_RUNNING;
+    case "stale":
+      return PI_STOP_STALE;
+    case "disabled":
+      return PI_STOP_DISABLED;
+    case "no_owner":
+      return PI_STOP_NO_OWNER;
+    case "unknown_run":
+      return PI_STOP_UNKNOWN_RUN;
+    case "ambiguous":
+      return PI_STOP_AMBIGUOUS;
+    case "no_token":
+      return PI_STOP_NO_TOKEN;
+    case "denied":
+      return PI_STOP_DENIED;
+    case "unknown":
+      return PI_STOP_UNKNOWN_OUTCOME;
+    default:
+      return PI_STOP_UNAVAILABLE;
+  }
+}
+
+/** Map a contract error code to a stop outcome. */
+function stopOutcomeFromCode(code: string | null | undefined): PiStopOutcome {
+  switch (code) {
+    case "INVALID_STATE":
+      return "not_running";
+    case "STALE_RUN":
+      return "stale";
+    case "DISABLED":
+      return "disabled";
+    case "NOT_FOUND":
+      return "unknown_run";
+    case "POLICY_DENIED":
+      return "denied";
+    case "STALE_OWNER":
+    case "OWNER_CLOSING":
+      return "no_owner";
+    case "OUTCOME_UNKNOWN":
+      return "unknown";
+    default:
+      return "unknown";
+  }
+}
+
+/**
+ * Handle a `/pi-stop` interaction.
+ *
+ * The run is named by its **generation token**: the client sends back the
+ * `startedAt` it saw for that run, and the owner refuses a mismatch with
+ * `STALE_RUN` — so a run that was resumed in the meantime is never stopped
+ * by mistake.
+ *
+ * Every path is ephemeral: refusals, success and internal errors.
+ */
+export async function handlePiStopInteraction(
+  interaction: PiStatusInteraction,
+  deps: PiStopInteractionDeps,
+): Promise<PiStopInteractionResult> {
+  const allowed = deps.allowedUserIds;
+  if (Array.isArray(allowed) && allowed.length > 0 && !allowed.includes(interaction.user.id)) {
+    try {
+      await interaction.reply({ content: PI_STATUS_REFUSAL, ephemeral: true });
+    } catch (err) {
+      console.error("[pi-discord-remote] /pi-stop: refusal reply failed:", describeErrorSafely(err));
+      return { ok: false, error: "refusal_failed" };
+    }
+    return { ok: false, error: "not_allowed" };
+  }
+
+  // Acknowledge first: Discord only allows 3 seconds for the first reply.
+  try {
+    await interaction.deferReply({ ephemeral: true });
+  } catch (err) {
+    console.error("[pi-discord-remote] /pi-stop: deferReply failed:", describeErrorSafely(err));
+    return { ok: false, error: "defer_failed" };
+  }
+
+  try {
+    const query = readStringOption(interaction, PI_STOP_OPTION_NAME) ?? "";
+    const runs = deps.listRuns();
+    if (runs === null) {
+      // No OptChat owner is bound — the run id was never going to match.
+      await interaction.editReply({ content: renderStopOutcome("no_owner") });
+      return { ok: true, outcome: "no_owner" };
+    }
+
+    const selection = resolveRunSelection(runs, query);
+
+    if (selection.kind === "ambiguous") {
+      await interaction.editReply({ content: renderStopOutcome("ambiguous") });
+      return { ok: true, outcome: "ambiguous" };
+    }
+    if (selection.kind === "unknown") {
+      await interaction.editReply({ content: renderStopOutcome("unknown_run") });
+      return { ok: true, outcome: "unknown_run" };
+    }
+    if (selection.kind === "no_token") {
+      await interaction.editReply({ content: renderStopOutcome("no_token") });
+      return { ok: true, outcome: "no_token" };
+    }
+
+    const run = selection.run;
+    const result = await deps.stopRun({
+      runId: run.runId,
+      expectedStartedAt: run.startedAt as number,
+    });
+
+    const outcome = result.ok ? "stopped" : stopOutcomeFromCode(result.code);
+    await interaction.editReply({ content: renderStopOutcome(outcome) });
+    return { ok: true, outcome };
+  } catch (err) {
+    // The detail stays in the local log — the Discord reply must never
+    // expose a stack trace, the bot token, the system prompt or file
+    // contents.
+    console.error("[pi-discord-remote] /pi-stop: stop failed:", describeErrorSafely(err));
+    try {
+      await interaction.editReply({ content: PI_STOP_UNAVAILABLE });
+    } catch {
+      /* the deferred reply is gone — nothing else we can do */
+    }
+    return { ok: false, error: "stop_unavailable" };
   }
 }
 

@@ -151,3 +151,44 @@ export async function withTimeout<T>(
     if (timer) clearTimeout(timer);
   }
 }
+
+// ─── Message gate ────────────────────────────────────────────────────────────
+
+/**
+ * A one-slot gate for "a Discord message is being prepared for injection".
+ *
+ * `agentBusy` only turns true once the turn has **started**, which happens
+ * after the message is handed to Pi. Preparing a message can take a while —
+ * an attachment has to be fetched and resized — and without a gate a second
+ * message would slip in during that window, overwrite the first one's reply
+ * target (so the reply @-mentions the wrong person) and inject out of order.
+ *
+ * The gate is claimed **synchronously**, before the first await, and released
+ * once the message has been handed over.
+ */
+export interface MessageGate {
+  /** Claim the slot. Returns false when a message is already in flight. */
+  tryClaim(): boolean;
+  /** Release the slot. Releasing an unclaimed slot does nothing. */
+  release(): void;
+  /** True while a message is in flight. */
+  isInFlight(): boolean;
+}
+
+/** Create a {@link MessageGate}. */
+export function createMessageGate(): MessageGate {
+  let inFlight = false;
+  return {
+    tryClaim(): boolean {
+      if (inFlight) return false;
+      inFlight = true;
+      return true;
+    },
+    release(): void {
+      inFlight = false;
+    },
+    isInFlight(): boolean {
+      return inFlight;
+    },
+  };
+}
